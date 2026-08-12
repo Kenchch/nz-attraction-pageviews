@@ -140,6 +140,39 @@ def start_date_for(con, venue: Venue, end: date, backfill_days: int) -> date:
     return watermark + timedelta(days=1)
 
 
+def _venue_watermark(
+    start: date,
+    end: date,
+    venue_clean: list[quality.CleanRow],
+    venue_bad: list[quality.BadRow],
+) -> date | None:
+    """How far this venue may advance. None means leave the watermark where it is.
+
+    The watermark is a promise that everything up to it has been dealt with, so it
+    must never step over a day we failed to load. A day whose row was quarantined
+    is not covered: the row is in `quarantine`, but the run-level gate is a rate
+    across every venue, so one venue's bad patch can sit under the threshold and
+    pass. If the watermark advanced anyway, those days would never be requested
+    again and the quarantine would be a record of data we permanently lost.
+
+    So a venue with nothing rejected advances to the end of the range it asked
+    for - including a window that came back genuinely empty, which is what stops
+    a quiet venue being re-requested forever. A venue with something rejected
+    advances only across the unbroken run of days it actually loaded, and stops
+    at the first gap. Next run resumes there and has another go at the bad day.
+    """
+    if not venue_bad:
+        return end
+
+    loaded = {row.view_date for row in venue_clean}
+    frontier = None
+    cursor = start
+    while cursor <= end and cursor in loaded:
+        frontier = cursor
+        cursor += timedelta(days=1)
+    return frontier
+
+
 def run(
     con,
     venues: list[Venue],
@@ -167,6 +200,9 @@ def run(
             if start > end:
                 continue  # already current, nothing to ask for
 
+            venue_clean: list[quality.CleanRow] = []
+            venue_bad: list[quality.BadRow] = []
+
             for window_start, window_end in plan_windows(start, end, chunk_days):
                 items = fetch(venue.wiki_article, window_start, window_end)
                 summary.requests += 1
@@ -180,12 +216,15 @@ def run(
                     end=window_end,
                     today=today,
                 )
-                clean.extend(good)
-                bad.extend(rejected)
+                venue_clean.extend(good)
+                venue_bad.extend(rejected)
 
-            # Only advance to days we actually asked for. A quiet window still
-            # counts as covered, otherwise we re-request it forever.
-            new_watermarks[venue.venue_id] = end
+            clean.extend(venue_clean)
+            bad.extend(venue_bad)
+
+            frontier = _venue_watermark(start, end, venue_clean, venue_bad)
+            if frontier is not None:
+                new_watermarks[venue.venue_id] = frontier
 
         summary.rows_quarantined = len(bad)
         summary.reject_rate = quality.enforce_gate(

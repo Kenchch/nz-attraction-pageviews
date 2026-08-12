@@ -182,6 +182,102 @@ def test_gate_failure_loads_nothing_and_is_logged(con):
     assert status == "failed"
 
 
+class Poisoner:
+    """Stub fetcher that returns negative views on a chosen set of days."""
+
+    def __init__(self, article, bad_days):
+        self.article = article
+        self.bad_days = set(bad_days)
+
+    def __call__(self, article, start, end):
+        rows, cursor = [], start
+        while cursor <= end:
+            bad = article == self.article and cursor in self.bad_days
+            rows.append(
+                {
+                    "project": "en.wikipedia",
+                    "article": article,
+                    "granularity": "daily",
+                    "timestamp": f"{cursor:%Y%m%d}00",
+                    "access": "all-access",
+                    "agent": "user",
+                    "views": -1 if bad else 100,
+                }
+            )
+            cursor += timedelta(days=1)
+        return rows
+
+
+def test_watermark_does_not_step_over_quarantined_days(con):
+    """The run-level gate is a rate across every venue, so one venue's bad patch
+    can sit under the threshold and pass. The watermark must not advance past it
+    anyway, or the quarantine becomes a record of data we permanently lost.
+    """
+    end = TODAY - timedelta(days=ingest.PUBLICATION_LAG_DAYS)
+    first_day = end - timedelta(days=9)
+    fetch = Poisoner("Milford_Sound", [first_day])
+
+    summary = ingest.run(
+        con, VENUES, today=TODAY, backfill_days=10, chunk_days=30, max_reject_rate=1.0, fetch=fetch
+    )
+
+    assert summary.rows_quarantined == 1
+    assert ingest.get_watermark(con, "milford-sound") is None, "must not advance over a lost day"
+    assert ingest.get_watermark(con, "te-papa") == end, "a clean venue is unaffected"
+
+
+def test_watermark_stops_at_the_first_bad_day_not_the_last(con):
+    end = TODAY - timedelta(days=ingest.PUBLICATION_LAG_DAYS)
+    first_day = end - timedelta(days=9)
+    bad_day = first_day + timedelta(days=3)
+    fetch = Poisoner("Milford_Sound", [bad_day])
+
+    ingest.run(
+        con, VENUES, today=TODAY, backfill_days=10, chunk_days=30, max_reject_rate=1.0, fetch=fetch
+    )
+
+    assert ingest.get_watermark(con, "milford-sound") == bad_day - timedelta(days=1)
+
+
+def test_next_run_recovers_days_the_watermark_refused_to_skip(con):
+    """The whole point of not advancing: the bad days get another go."""
+    end = TODAY - timedelta(days=ingest.PUBLICATION_LAG_DAYS)
+    bad_day = end - timedelta(days=6)
+
+    ingest.run(
+        con,
+        VENUES,
+        today=TODAY,
+        backfill_days=10,
+        chunk_days=30,
+        max_reject_rate=1.0,
+        fetch=Poisoner("Milford_Sound", [bad_day]),
+    )
+    loaded = con.execute(
+        "SELECT count(*) FROM pageviews WHERE venue_id = 'milford-sound'"
+    ).fetchone()[0]
+    assert loaded == 9, "the bad day is missing"
+
+    ingest.run(con, VENUES, today=TODAY, backfill_days=10, chunk_days=30, fetch=Recorder())
+
+    recovered = con.execute(
+        "SELECT count(*) FROM pageviews WHERE venue_id = 'milford-sound'"
+    ).fetchone()[0]
+    assert recovered == 10, "the day that was quarantined should be picked up next run"
+    assert ingest.get_watermark(con, "milford-sound") == end
+
+
+def test_empty_window_still_advances_the_watermark(con):
+    """A genuinely quiet venue must not be re-requested forever."""
+
+    def nothing(article, start, end):
+        return []
+
+    ingest.run(con, VENUES, today=TODAY, backfill_days=10, chunk_days=30, fetch=nothing)
+    expected_end = TODAY - timedelta(days=ingest.PUBLICATION_LAG_DAYS)
+    assert ingest.get_watermark(con, "milford-sound") == expected_end
+
+
 def test_run_log_records_every_run(con):
     ingest.run(con, VENUES, today=TODAY, backfill_days=5, chunk_days=30, fetch=Recorder())
     row = con.execute(
