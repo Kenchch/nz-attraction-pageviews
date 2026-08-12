@@ -44,7 +44,9 @@ def main() -> None:
     random.seed(7)
     venues = ingest.read_venues("venues.csv")
     con = ingest.connect(DB)
-    con.execute("DELETE FROM pageviews; DELETE FROM watermark; DELETE FROM run_log")
+    con.execute(
+        "DELETE FROM pageviews; DELETE FROM quarantine; DELETE FROM watermark; DELETE FROM run_log"
+    )
 
     for label, day in (("run 1 (first sight)", RUN_1_DAY), ("run 2 (three days later)", RUN_2_DAY)):
         summary = ingest.run(

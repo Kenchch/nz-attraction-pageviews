@@ -182,9 +182,7 @@ def fetch_window(
     that was actually requested. Only when every widening also 404s do we accept
     that there was no traffic.
     """
-    items = _fetch_once(
-        article, start, end, opener=opener, max_attempts=max_attempts, sleep=sleep
-    )
+    items = _fetch_once(article, start, end, opener=opener, max_attempts=max_attempts, sleep=sleep)
     if items is not None:
         return items
 

@@ -7,6 +7,9 @@ dependencies = ["duckdb>=1.0"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# Put the project root on sys.path so `pytest` works, not just `python -m pytest`
+# (the -m form adds the working directory for you; the bare command does not).
+pythonpath = ["."]
 
 [tool.ruff]
 line-length = 100

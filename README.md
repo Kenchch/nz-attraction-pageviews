@@ -20,7 +20,7 @@ pip install -r requirements.txt
 
 python demo.py        # offline, synthetic API, no network needed
 python -m src         # live, hits the Wikimedia API
-pytest -q             # 39 tests, all offline
+pytest -q             # 43 tests, all offline
 ```
 
 `demo.py` output:
@@ -72,16 +72,33 @@ and recreates the burst that caused the throttle.
 the field name in the message. The alternative is that the field silently
 becomes NULL and surfaces three tables downstream as a chart with a gap in it.
 
-**4. Bad rows are quarantined, not dropped.**
+**4. Bad rows are quarantined, not dropped — and the watermark respects that.**
 Every rejected row lands in `quarantine` with the rule it broke and its raw
 payload. "Why is Tuesday missing" is then a SQL query, not an archaeology dig
 through rotated logs. Rules are checked in order, so the rule you see is the
 root cause and not a downstream symptom.
 
+Quarantining is only half of it. The gate below is a rate across the whole run,
+so one venue's bad patch can sit under the threshold and pass: 10 bad days out
+of 240 rows is 4.2%, the run reports `ok`, and that venue loads 20 days instead
+of 30. If its watermark then advanced to the end of the range anyway, those 10
+days would never be requested again and the quarantine would be a record of data
+permanently lost — quarantine with the outcome of a drop.
+
+So a venue advances its watermark only across the unbroken run of days it
+actually loaded, and stops at the first gap. Next run resumes there and has
+another go. A venue with nothing rejected advances to the end of its range,
+including a window that came back genuinely empty, which is what keeps a quiet
+venue from being re-requested forever.
+
 **5. The gate runs before the load, not after.**
 If more than 5% of a run is rejected, nothing is written and last night's data
 stays intact. A partial load is worse than no load, because a partial load still
-renders on a dashboard and looks fine.
+renders on a dashboard and looks fine. The gate is deliberately a whole-run rate
+rather than a per-venue one: at eight venues on a daily schedule a per-venue rate
+is one or two rows, where a single bad row reads as 100% and would abort the run
+for everyone. Decision 4 is what makes that safe — the run continues, but no
+venue advances past a day it did not load.
 
 **6. The load is one transaction, and re-running is free.**
 `pageviews` is keyed on `(venue_id, view_date)` and loaded with
@@ -127,7 +144,7 @@ Applied per row, in this order:
 
 ## Testing
 
-39 tests, no network. The HTTP call is injected into `fetch_window` and the
+43 tests, no network. The HTTP call is injected into `fetch_window` and the
 fetcher is injected into `ingest.run`, so the suite drives real code paths with
 stubbed transport rather than mocking out the logic being tested.
 
@@ -137,9 +154,10 @@ rows trimmed to the requested window, unparseable timestamps left for quarantine
 rather than dropped in the trim, `Retry-After` honoured, backoff growth, give-up
 after max attempts, 400 not retried, both schema drift cases, every acceptance
 rule, window tiling with no gap or overlap, watermark resume, idempotent re-run,
-restatement overwrite, and a gate failure leaving the warehouse untouched.
+restatement overwrite, a gate failure leaving the warehouse untouched, and the
+watermark refusing to step over a quarantined day while a later run recovers it.
 
-CI runs lint and tests on Python 3.10 through 3.13.
+CI runs lint, format check, and tests on Python 3.10 through 3.13.
 
 ## Limits
 
@@ -147,6 +165,15 @@ CI runs lint and tests on Python 3.10 through 3.13.
 - Wikimedia publishes with a lag, so the job stops two days short of today.
 - Runs are sequential. Eight venues is small enough that concurrency would add
   more failure modes than it removes wall clock.
+- Verifying a 404 costs up to two extra requests for that window, so a run where
+  every venue is quiet is three times the request volume. At eight venues that is
+  noise. At several hundred it would need a cap, or a memo of which windows have
+  already been verified empty so a backfill does not re-verify them every night.
+- A venue whose bad day never becomes good stops advancing and re-fetches that
+  day every run. That is the deliberate trade against silently skipping it, and
+  it is visible rather than silent: the watermark stalls and `quarantine` grows.
+  A stuck venue is a query — `SELECT venue_id, last_date FROM watermark ORDER BY
+  last_date` — not a surprise six months later.
 - The watermark advances to the end of the requested range, including windows
   that came back empty. Otherwise a genuinely quiet venue would be re-requested
   forever. Decision 1 is what makes that safe: an empty window is verified
