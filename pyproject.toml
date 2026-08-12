@@ -1,0 +1,16 @@
+[project]
+name = "nz-attraction-pageviews"
+version = "0.1.0"
+description = "Incremental API ingest of Wikipedia pageviews for NZ visitor attractions"
+requires-python = ">=3.10"
+dependencies = ["duckdb>=1.0"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]

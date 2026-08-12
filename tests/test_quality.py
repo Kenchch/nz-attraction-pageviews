@@ -1,0 +1,100 @@
+"""Acceptance criteria tests."""
+
+from __future__ import annotations
+
+from datetime import date
+
+import pytest
+
+from src import quality
+
+ARTICLE = "Milford_Sound"
+START = date(2026, 1, 1)
+END = date(2026, 1, 31)
+TODAY = date(2026, 2, 10)
+
+
+def item(timestamp="2026010100", views=120, article=ARTICLE):
+    return {
+        "project": "en.wikipedia",
+        "article": article,
+        "granularity": "daily",
+        "timestamp": timestamp,
+        "access": "all-access",
+        "agent": "user",
+        "views": views,
+    }
+
+
+def check(items):
+    return quality.check_window(
+        items, venue_id="milford-sound", article=ARTICLE, start=START, end=END, today=TODAY
+    )
+
+
+def test_good_row_passes():
+    clean, bad = check([item()])
+    assert bad == []
+    assert clean[0].view_date == date(2026, 1, 1)
+    assert clean[0].views == 120
+
+
+def test_negative_views_quarantined():
+    clean, bad = check([item(views=-4)])
+    assert clean == []
+    assert bad[0].rule == "views_non_negative"
+
+
+def test_string_views_quarantined():
+    clean, bad = check([item(views="120")])
+    assert clean == []
+    assert bad[0].rule == "views_is_integer"
+
+
+def test_bool_is_not_an_integer():
+    """True == 1 in Python. Without an explicit check this loads as 1 view."""
+    clean, bad = check([item(views=True)])
+    assert clean == []
+    assert bad[0].rule == "views_is_integer"
+
+
+def test_date_outside_window_quarantined():
+    clean, bad = check([item(timestamp="2025120100")])
+    assert clean == []
+    assert bad[0].rule == "date_in_requested_window"
+
+
+def test_unparseable_timestamp_quarantined():
+    clean, bad = check([item(timestamp="2026-01-01")])
+    assert clean == []
+    assert bad[0].rule == "timestamp_parses"
+
+
+def test_wrong_article_quarantined():
+    clean, bad = check([item(article="Doubtful_Sound")])
+    assert clean == []
+    assert bad[0].rule == "article_matches_request"
+
+
+def test_duplicate_date_keeps_first_quarantines_second():
+    clean, bad = check([item(views=100), item(views=999)])
+    assert [r.views for r in clean] == [100]
+    assert bad[0].rule == "one_row_per_date"
+
+
+def test_quarantined_row_keeps_the_raw_payload():
+    _, bad = check([item(views=-1)])
+    assert "-1" in bad[0].raw
+
+
+def test_gate_passes_under_threshold():
+    assert quality.enforce_gate(fetched=100, quarantined=3, max_reject_rate=0.05) == 0.03
+
+
+def test_gate_fails_over_threshold():
+    with pytest.raises(quality.QualityGateFailed, match="Nothing was loaded"):
+        quality.enforce_gate(fetched=100, quarantined=9, max_reject_rate=0.05)
+
+
+def test_gate_handles_empty_run():
+    assert quality.enforce_gate(fetched=0, quarantined=0, max_reject_rate=0.05) == 0.0
