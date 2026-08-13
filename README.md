@@ -20,9 +20,9 @@ venues.csv  ->  windowed API calls  ->  acceptance criteria  ->  gate  ->  DuckD
 ```bash
 pip install -r requirements.txt
 
-python demo.py        # offline, synthetic API, no network needed
-python -m src         # live, hits the Wikimedia API
-pytest -q             # 72 tests, all offline
+python demo.py                     # offline, synthetic API, no network needed
+python -m nz_attraction_pageviews  # live, hits the Wikimedia API
+pytest -q                          # 80 tests, all offline
 ```
 
 `demo.py` output:
@@ -69,10 +69,16 @@ loaded 690 rows instead of 720 and called itself `ok`.
 
 So an empty answer is checked twice over: widen first, and if that still comes
 back empty, halve the window and ask about the pieces, recursing only into the
-pieces that also 404. The 30 day window above gives up all 30 days for 9
+pieces that also 404. Against `WidthSensitiveApi` in the test suite, which
+refuses any span over 7 days, a 30 day window gives up all 30 days for 13
 requests. An article that genuinely does not exist answers 404 at every width
 and every slice, down to single days, which is what stops this from inventing
 data.
+
+The live count is deliberately not quoted, because it does not hold still: the
+same 2026-07-13..2026-08-11 window that 404'd eight times out of eight later
+answered 200 on the first request. That is the argument for verifying rather
+than measuring once and hard-coding what you saw.
 
 A 200 gets no more benefit of the doubt than the 404 did. If the widened retry
 succeeds but mentions none of the days actually asked for, that is not an answer
@@ -122,12 +128,23 @@ still march to the end of the range. That is what a publication lag longer than
 `PUBLICATION_LAG_DAYS` looks like, and two days is an assumption about Wikimedia,
 not a promise from it.
 
-So the watermark moves across days it can account for and stops at the first day
-it cannot, whether that day was quarantined or simply never arrived. Next run
-resumes there and tries again. A day in a window that came back *genuinely* empty
-does count as accounted for, because decision 1 only reports empty after widening
-and subdividing — that is an answer, not an absence, and it is what keeps a quiet
-venue from being re-requested forever.
+An absent day is genuinely ambiguous, and no amount of asking resolves it. The
+API omits days with no traffic rather than sending a zero, so absent means either
+"nobody looked" or "not published yet" — and an unpublished day 404s at every
+width and every slice exactly like a quiet one, so decision 1 cannot tell them
+apart either. Picking one meaning is wrong in one direction or the other:
+believing "quiet" loses days whenever the lag runs long, and believing
+"unpublished" strands any venue quiet enough to have gaps. `Te_Rerenga_Wairua`
+has 74 absent days out of 90.
+
+Two things do resolve it. Publication runs in date order, so *anything before a
+day that did arrive is settled* — a later day arriving proves the earlier one was
+published, and its absence can only mean quiet. Past that, only age: an absent
+day older than `TRUST_LAG_DAYS` is taken as quiet, a more recent one is left
+alone and asked for again next run. So the watermark advances to the last day
+actually loaded, holes behind it included, or to the trust line, whichever is
+further — and never past a quarantined day, whatever its age. The cost is that
+every venue re-asks for its last few days each night.
 
 **5. The gate runs before the load, not after.**
 If more than 5% of a run is rejected, nothing is written and last night's data
@@ -197,7 +214,7 @@ Applied per row, in this order:
 
 ## Testing
 
-72 tests, no network. The HTTP call is injected into `fetch_window` and the
+80 tests, no network. The HTTP call is injected into `fetch_window` and the
 fetcher is injected into `ingest.run`, so the suite drives real code paths with
 stubbed transport rather than mocking out the logic being tested.
 
@@ -215,10 +232,14 @@ restatement overwrite, a gate failure leaving the warehouse untouched and still
 logging the rate that failed it, the watermark refusing to step over a
 quarantined day, over a day missing from the tail of a 200, or over a hole in the
 middle of one — while a later run recovers all three — quarantined rows carrying
-the day they belong to (and a null day when that is the defect), the lookback cap
-bounding a stuck venue while recording what it gave up on even when the run then
-fails, and `Retry-After` capped rather than obeyed when a server asks for a day
-or sends something that is not a finite number.
+the day they belong to (and a null day when that is the defect), an absent day
+trusted once something later arrives or once it is old enough but not before, a
+sparse venue still making progress, the watermark never moving backwards, the
+lookback cap bounding a stuck venue while recording what it gave up on even when
+the run then fails, `Retry-After` capped rather than obeyed when a server asks
+for a day or sends something that is not a finite number, and `venues.csv`
+rejected with a line number for a blank field, a duplicate `venue_id` or a
+missing column while tolerating a BOM and an extra column.
 
 CI runs lint, format check, and tests on Python 3.10 through 3.13.
 
@@ -265,7 +286,8 @@ CI runs lint, format check, and tests on Python 3.10 through 3.13.
 
 Wikimedia Analytics pageviews API, `per-article` daily, `all-access`, `user`
 agent (bots excluded). No API key. Wikimedia asks for a contactable User-Agent,
-set in `src/client.py` — change it to your own before running the live path.
+set in `nz_attraction_pageviews/client.py` — change it to your own before running
+the live path.
 
 Titles in `venues.csv` must be canonical, not redirects. The pageviews API is
 title-exact and does not follow redirects, so a redirect title returns only the

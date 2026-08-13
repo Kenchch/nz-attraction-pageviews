@@ -6,7 +6,7 @@ from datetime import date
 
 import pytest
 
-from src import quality
+from nz_attraction_pageviews import quality
 
 ARTICLE = "Milford_Sound"
 START = date(2026, 1, 1)

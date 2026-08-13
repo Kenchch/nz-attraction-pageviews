@@ -1,9 +1,20 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "nz-attraction-pageviews"
 version = "0.1.0"
 description = "Incremental API ingest of Wikipedia pageviews for NZ visitor attractions"
 requires-python = ">=3.10"
 dependencies = ["duckdb>=1.0"]
+
+# Named explicitly rather than left to auto-discovery. When the package was a
+# directory called `src`, setuptools read it as a src-layout root and built a
+# wheel that installed client.py, ingest.py and quality.py at the top level of
+# site-packages, where `import client` would collide with anyone else's.
+[tool.setuptools]
+packages = ["nz_attraction_pageviews"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
