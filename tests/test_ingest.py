@@ -267,6 +267,84 @@ def test_next_run_recovers_days_the_watermark_refused_to_skip(con):
     assert ingest.get_watermark(con, "milford-sound") == end
 
 
+class Laggy:
+    """200, but nothing newer than `published_to`. What a publication lag longer
+    than PUBLICATION_LAG_DAYS looks like: no error, no rejects, just fewer days
+    than were asked for."""
+
+    def __init__(self, published_to, skip=()):
+        self.published_to = published_to
+        self.skip = set(skip)
+
+    def __call__(self, article, start, end):
+        rows, cursor = [], start
+        while cursor <= end:
+            if cursor <= self.published_to and cursor not in self.skip:
+                rows.append(
+                    {
+                        "project": "en.wikipedia",
+                        "article": article,
+                        "granularity": "daily",
+                        "timestamp": f"{cursor:%Y%m%d}00",
+                        "access": "all-access",
+                        "agent": "user",
+                        "views": 100,
+                    }
+                )
+            cursor += timedelta(days=1)
+        return rows
+
+
+def test_watermark_stops_where_the_api_stopped_publishing(con):
+    """PUBLICATION_LAG_DAYS is an assumption, not a guarantee. When the real lag
+    is longer, the tail of the window is absent from a 200 - no rule fires,
+    because the acceptance criteria only judge rows that turned up."""
+    end = TODAY - timedelta(days=ingest.PUBLICATION_LAG_DAYS)
+    published_to = end - timedelta(days=3)
+
+    summary = ingest.run(
+        con, VENUES, today=TODAY, backfill_days=10, chunk_days=30, fetch=Laggy(published_to)
+    )
+
+    assert summary.rows_quarantined == 0, "nothing is rejected; the days simply never arrive"
+    assert ingest.get_watermark(con, "milford-sound") == published_to
+
+
+def test_days_absent_from_a_200_are_picked_up_once_they_publish(con):
+    end = TODAY - timedelta(days=ingest.PUBLICATION_LAG_DAYS)
+    published_to = end - timedelta(days=3)
+
+    ingest.run(con, VENUES, today=TODAY, backfill_days=10, chunk_days=30, fetch=Laggy(published_to))
+    before = con.execute(
+        "SELECT count(*) FROM pageviews WHERE venue_id = 'milford-sound'"
+    ).fetchone()[0]
+
+    ingest.run(con, VENUES, today=TODAY, backfill_days=10, chunk_days=30, fetch=Recorder())
+
+    after = con.execute(
+        "SELECT count(*) FROM pageviews WHERE venue_id = 'milford-sound'"
+    ).fetchone()[0]
+    assert (before, after) == (7, 10), "the three late days should arrive on the next run"
+    assert ingest.get_watermark(con, "milford-sound") == end
+
+
+def test_a_hole_in_the_middle_of_a_200_stops_the_watermark(con):
+    """Not only the tail. A day missing from the middle is just as unaccounted for."""
+    end = TODAY - timedelta(days=ingest.PUBLICATION_LAG_DAYS)
+    hole = end - timedelta(days=5)
+
+    ingest.run(
+        con,
+        VENUES,
+        today=TODAY,
+        backfill_days=10,
+        chunk_days=30,
+        fetch=Laggy(end, skip=[hole]),
+    )
+
+    assert ingest.get_watermark(con, "milford-sound") == hole - timedelta(days=1)
+
+
 def test_empty_window_still_advances_the_watermark(con):
     """A genuinely quiet venue must not be re-requested forever."""
 

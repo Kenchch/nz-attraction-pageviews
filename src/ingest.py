@@ -160,36 +160,40 @@ def start_date_for(con, venue: Venue, end: date, backfill_days: int) -> date:
     return watermark + timedelta(days=1)
 
 
-def _venue_watermark(
-    start: date,
-    end: date,
-    venue_clean: list[quality.CleanRow],
-    venue_bad: list[quality.BadRow],
-) -> date | None:
+def _days(start: date, end: date):
+    cursor = start
+    while cursor <= end:
+        yield cursor
+        cursor += timedelta(days=1)
+
+
+def _venue_watermark(start: date, end: date, covered: set[date]) -> date | None:
     """How far this venue may advance. None means leave the watermark where it is.
 
-    The watermark is a promise that everything up to it has been dealt with, so it
-    must never step over a day we failed to load. A day whose row was quarantined
-    is not covered: the row is in `quarantine`, but the run-level gate is a rate
-    across every venue, so one venue's bad patch can sit under the threshold and
-    pass. If the watermark advanced anyway, those days would never be requested
-    again and the quarantine would be a record of data we permanently lost.
+    The watermark is a promise that every day up to it has been dealt with, so it
+    may only move across days we can actually account for. It stops at the first
+    day we cannot, and the next run resumes there and tries again.
 
-    So a venue with nothing rejected advances to the end of the range it asked
-    for - including a window that came back genuinely empty, which is what stops
-    a quiet venue being re-requested forever. A venue with something rejected
-    advances only across the unbroken run of days it actually loaded, and stops
-    at the first gap. Next run resumes there and has another go at the bad day.
+    Three ways a day fails to be accounted for, all of which used to be silent:
+
+    - Its row was quarantined. The row is in `quarantine`, but the gate is a rate
+      across every venue, so one venue's bad patch can sit under the threshold
+      and pass. Advancing anyway would make the quarantine a record of data we
+      permanently lost.
+    - The API answered 200 and simply did not mention the day. Nothing is
+      rejected, because the acceptance criteria only judge rows that turned up.
+      This is what a publication lag longer than PUBLICATION_LAG_DAYS looks like,
+      and the lag is an assumption, not a guarantee.
+    - The day is in a window that came back genuinely empty. This one *is*
+      accounted for: `client.fetch_window` only reports empty after widening and
+      subdividing, so it is a real answer rather than an absence, and the day
+      counts as covered. Otherwise a quiet venue would be re-requested forever.
     """
-    if not venue_bad:
-        return end
-
-    loaded = {row.view_date for row in venue_clean}
     frontier = None
-    cursor = start
-    while cursor <= end and cursor in loaded:
-        frontier = cursor
-        cursor += timedelta(days=1)
+    for day in _days(start, end):
+        if day not in covered:
+            break
+        frontier = day
     return frontier
 
 
@@ -228,8 +232,7 @@ def run(
             if start > end:
                 continue  # already current, nothing to ask for
 
-            venue_clean: list[quality.CleanRow] = []
-            venue_bad: list[quality.BadRow] = []
+            covered: set[date] = set()
 
             for window_start, window_end in plan_windows(start, end, chunk_days):
                 items = fetch(venue.wiki_article, window_start, window_end)
@@ -244,13 +247,20 @@ def run(
                     end=window_end,
                     today=today,
                 )
-                venue_clean.extend(good)
-                venue_bad.extend(rejected)
+                clean.extend(good)
+                bad.extend(rejected)
 
-            clean.extend(venue_clean)
-            bad.extend(venue_bad)
+                if items:
+                    # The API spoke for this window, so it has spoken only for the
+                    # days it actually mentioned. Days it left out are not covered,
+                    # whatever the reason.
+                    covered.update(row.view_date for row in good)
+                else:
+                    # Empty, and `fetch` only says that after widening and
+                    # subdividing, so it is an answer about the whole window.
+                    covered.update(_days(window_start, window_end))
 
-            frontier = _venue_watermark(start, end, venue_clean, venue_bad)
+            frontier = _venue_watermark(start, end, covered)
             if frontier is not None:
                 new_watermarks[venue.venue_id] = frontier
 
