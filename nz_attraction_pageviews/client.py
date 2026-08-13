@@ -255,6 +255,14 @@ def fetch_window(
     if items is not None:
         return items
 
+    recovered: dict[str, dict] = {}
+
+    def keep(candidates):
+        for item in candidates:
+            if _within(item, start, end):
+                recovered.setdefault(str(item.get("timestamp")), item)
+
+    # Widening is a cheap way to get rows, never evidence that there are none.
     for pad in verify_pads:
         widened = _fetch_once(
             article,
@@ -264,21 +272,16 @@ def fetch_window(
             max_attempts=max_attempts,
             sleep=sleep,
         )
-        if widened is None:
-            continue
-        in_range = [item for item in widened if _within(item, start, end)]
-        if in_range:
-            return in_range
-        # A 200 that does not mention a single day we asked about is not an
-        # answer about those days. Trusting it here would be the same mistake as
-        # trusting the 404, and a worse one: the caller reads an empty list as a
-        # verified-quiet window and advances its watermark over the lot. Whether
-        # a response contains the days you asked for depends on the shape of the
-        # request, which is the premise this whole module is built on.
-        break
+        if widened is not None:
+            keep(widened)
+            break
 
-    found = _subdivide(article, start, end, opener=opener, max_attempts=max_attempts, sleep=sleep)
-    # Trimmed on the way out for the same reason the widened path is: a slice can
-    # answer with days nobody asked about, and the two paths should not disagree
-    # about what this function is allowed to return.
-    return [item for item in found if _within(item, start, end)]
+    # Subdivide regardless of what the widening produced. A widened 200 can
+    # mention some of the requested days and quietly omit the rest, which is the
+    # same failure as the 404 wearing a success code, and returning early on the
+    # partial answer would leave the omitted days to be noticed by the watermark
+    # rather than fixed here. Subdivision only recurses into pieces that 404, so
+    # when the data is there this costs two requests.
+    keep(_subdivide(article, start, end, opener=opener, max_attempts=max_attempts, sleep=sleep))
+
+    return sorted(recovered.values(), key=lambda item: str(item.get("timestamp")))

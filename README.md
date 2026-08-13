@@ -22,7 +22,7 @@ pip install -r requirements.txt
 
 python demo.py                     # offline, synthetic API, no network needed
 python -m nz_attraction_pageviews  # live, hits the Wikimedia API
-pytest -q                          # 80 tests, all offline
+pytest -q                          # 82 tests, all offline
 ```
 
 `demo.py` output:
@@ -80,11 +80,14 @@ same 2026-07-13..2026-08-11 window that 404'd eight times out of eight later
 answered 200 on the first request. That is the argument for verifying rather
 than measuring once and hard-coding what you saw.
 
-A 200 gets no more benefit of the doubt than the 404 did. If the widened retry
-succeeds but mentions none of the days actually asked for, that is not an answer
-about those days, and subdividing goes ahead anyway. Believing it would be the
-worse mistake of the two: an empty list reads to the caller as a verified-quiet
-window, and the watermark would step over the lot.
+A 200 gets no more benefit of the doubt than the 404 did. Widening is treated as
+a cheap way to *get* rows, never as evidence that there are none, so the
+subdivision runs regardless of what the widening produced and the two results are
+merged by day. A widened response that answers with only some of the requested
+days is the same failure as the 404 wearing a success code, and returning early
+on it would leave the omitted days for the watermark to notice rather than fixing
+them here. That costs two extra requests when the halves answer — the whole
+subdivision only recurses into pieces that 404.
 
 **2. Retry 429 and 5xx. Never retry 400.**
 A malformed request will be malformed on the retry too, so retrying it only
@@ -214,7 +217,7 @@ Applied per row, in this order:
 
 ## Testing
 
-80 tests, no network. The HTTP call is injected into `fetch_window` and the
+82 tests, no network. The HTTP call is injected into `fetch_window` and the
 fetcher is injected into `ingest.run`, so the suite drives real code paths with
 stubbed transport rather than mocking out the logic being tested.
 
@@ -254,13 +257,14 @@ CI runs lint, format check, and tests on Python 3.10 through 3.13.
 - Runs are sequential. Eight venues is small enough that concurrency would add
   more failure modes than it removes wall clock.
 - Verifying a 404 is not free, and the bill scales with how wrong the API is
-  being. A spurious 404 on a 30 day window costs about 9 requests to unpick. A
-  window that really is empty is the expensive case, because it 404s all the way
-  down: roughly 2n requests for an n day window, so a mis-typed article title
-  costs ~60 requests per window per run rather than 1. At eight venues that is
-  affordable and the alternative is losing days silently. At several hundred it
-  would need a memo of which windows have already been verified empty, so a
-  backfill does not re-derive the same nothing every night.
+  being. Measured on a 30 day window against the stubs in the test suite: 4
+  requests when only that exact window is refused, 13 when the widenings fail too
+  and the answer is only reachable in 7 day slices, and 61 when the article does
+  not exist at all — because that 404s the whole way down to single days. So a
+  mis-typed title costs ~60 requests per window per run instead of 1. At eight
+  venues that is affordable, and the alternative is losing days silently. At
+  several hundred it would need a memo of which windows have already been
+  verified empty, so a backfill does not re-derive the same nothing every night.
 - `run_log.requests` counts windows asked for, not HTTP calls. Verification can
   turn one window into several calls, so the two diverge exactly when the API is
   misbehaving.
