@@ -105,9 +105,9 @@ CREATE TABLE IF NOT EXISTS run_log (
 
 # `CREATE TABLE IF NOT EXISTS` does nothing to a table that already exists, so a
 # warehouse built by an earlier version keeps the old shape and the next insert
-# fails on the column count. Adding the column is idempotent, and the inserts
-# name their columns, so it does not matter that the migrated column lands at the
-# end rather than in the middle where the DDL above puts it.
+# fails on the column count. Adding the column is idempotent, and every insert in
+# this module names its columns, so it does not matter that a migrated column
+# lands at the end rather than in the middle where the DDL above puts it.
 MIGRATIONS = """
 ALTER TABLE quarantine ADD COLUMN IF NOT EXISTS view_date DATE;
 """
@@ -359,7 +359,9 @@ def _load(con, run_id, clean, bad, new_watermarks) -> None:
     try:
         if clean:
             con.executemany(
-                "INSERT OR REPLACE INTO pageviews VALUES (?, ?, ?, ?, ?, ?)",
+                "INSERT OR REPLACE INTO pageviews "
+                "(venue_id, article, view_date, views, run_id, loaded_at) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
                 [(r.venue_id, r.article, r.view_date, r.views, run_id, now) for r in clean],
             )
         if bad:
@@ -374,7 +376,8 @@ def _load(con, run_id, clean, bad, new_watermarks) -> None:
             )
         if new_watermarks:
             con.executemany(
-                "INSERT OR REPLACE INTO watermark VALUES (?, ?, ?)",
+                "INSERT OR REPLACE INTO watermark (venue_id, last_date, updated_at) "
+                "VALUES (?, ?, ?)",
                 [(vid, last, now) for vid, last in new_watermarks.items()],
             )
         con.execute("COMMIT")
@@ -385,7 +388,10 @@ def _load(con, run_id, clean, bad, new_watermarks) -> None:
 
 def _write_run_log(con, summary: RunSummary, started_at: datetime) -> None:
     con.execute(
-        "INSERT OR REPLACE INTO run_log VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "INSERT OR REPLACE INTO run_log "
+        "(run_id, started_at, finished_at, status, venues, requests, "
+        " rows_fetched, rows_loaded, rows_quarantined, reject_rate, note) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         [
             summary.run_id,
             started_at,
