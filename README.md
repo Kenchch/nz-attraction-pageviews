@@ -1,5 +1,7 @@
 # NZ Attraction Pageviews
 
+[![CI](https://github.com/Kenchch/nz-attraction-pageviews/actions/workflows/ci.yml/badge.svg)](https://github.com/Kenchch/nz-attraction-pageviews/actions/workflows/ci.yml)
+
 Incremental ingest of daily Wikipedia pageviews for eight New Zealand visitor
 attractions, into DuckDB.
 
