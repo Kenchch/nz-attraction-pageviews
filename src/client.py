@@ -19,6 +19,7 @@ The network call is injected (`opener`) so the tests run offline.
 from __future__ import annotations
 
 import json
+import math
 import random
 import time
 import urllib.error
@@ -41,6 +42,15 @@ EXPECTED_FIELDS = frozenset(
 
 RETRYABLE_STATUS = frozenset({429, 500, 502, 503, 504})
 TRANSPORT_STATUS = 599  # our own marker for "the socket died", not an HTTP code
+
+# Longest we will wait between attempts, however long the server asks for.
+# Retry-After is a number from someone else's infrastructure: a misconfigured
+# proxy answering 86400 would otherwise park a nightly job for a day, and it
+# parses `inf` just as happily. Honour the header up to this, then stop
+# honouring it. With max_attempts at 4 the whole retry sequence is bounded at a
+# few minutes, after which the window fails loudly and the watermark does not
+# move, so the days are re-asked for tomorrow rather than lost.
+MAX_BACKOFF_SECONDS = 120.0
 
 # How far back to extend the start date when re-asking a window that answered
 # 404. Observed against the live API: a window can 404 while a wider window
@@ -89,14 +99,21 @@ def _backoff_seconds(attempt: int, headers: dict[str, str]) -> float:
     Jitter matters when several venues are being fetched in a loop: without it
     every retry lands on the same second and we re-create the burst that got us
     throttled in the first place.
+
+    Both paths are capped at MAX_BACKOFF_SECONDS. Retry-After is a number chosen
+    by someone else's infrastructure, and `float` accepts `inf` and `nan` as
+    readily as `30`, so it is taken as a request rather than an instruction.
+    A header we cannot make sense of falls through to our own backoff.
     """
     retry_after = headers.get("Retry-After") or headers.get("retry-after")
     if retry_after:
         try:
-            return float(retry_after)
+            requested = float(retry_after)
         except ValueError:
-            pass
-    return (2.0**attempt) + random.uniform(0, 0.5)
+            requested = None  # an HTTP-date, or nonsense. Use our own backoff.
+        if requested is not None and math.isfinite(requested):
+            return max(0.0, min(requested, MAX_BACKOFF_SECONDS))
+    return min((2.0**attempt) + random.uniform(0, 0.5), MAX_BACKOFF_SECONDS)
 
 
 def _parse(body: bytes, article: str) -> list[dict]:

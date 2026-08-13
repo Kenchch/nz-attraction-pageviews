@@ -233,6 +233,31 @@ def test_429_is_retried_then_succeeds():
     assert slept == [3.0], "should honour Retry-After rather than its own backoff"
 
 
+def test_absurd_retry_after_is_capped():
+    """Retry-After comes from someone else's infrastructure. A misconfigured
+    proxy answering 86400 would otherwise park a nightly job for a day."""
+    assert client._backoff_seconds(1, {"Retry-After": "86400"}) == client.MAX_BACKOFF_SECONDS
+
+
+def test_reasonable_retry_after_is_still_honoured_exactly():
+    assert client._backoff_seconds(1, {"Retry-After": "30"}) == 30.0
+
+
+def test_non_finite_retry_after_falls_back_to_our_own_backoff():
+    """`float` accepts 'inf' and 'nan' as readily as '30'. Sleeping either is a hang."""
+    for header in ("inf", "nan", "-inf"):
+        seconds = client._backoff_seconds(1, {"Retry-After": header})
+        assert 0 < seconds <= client.MAX_BACKOFF_SECONDS, f"{header} produced {seconds}"
+
+
+def test_negative_retry_after_does_not_go_backwards():
+    assert client._backoff_seconds(1, {"Retry-After": "-5"}) == 0.0
+
+
+def test_our_own_backoff_is_capped_too():
+    assert client._backoff_seconds(40, {}) == client.MAX_BACKOFF_SECONDS
+
+
 def test_backoff_grows_when_no_retry_after_header():
     slept = []
     opener = Opener((503, {}, b""), (503, {}, b""), (200, {}, canned()))
