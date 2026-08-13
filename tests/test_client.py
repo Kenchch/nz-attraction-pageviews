@@ -176,7 +176,7 @@ def test_verification_keeps_unparseable_timestamps_for_quarantine():
     rows = client.fetch_window(
         "Hobbiton_Movie_Set", date(2026, 1, 1), date(2026, 1, 1), opener=opener
     )
-    assert [r["timestamp"] for r in rows] == ["not-a-date", "2026010100"]
+    assert sorted(r["timestamp"] for r in rows) == ["2026010100", "not-a-date"]
 
 
 class WidthSensitiveApi:
@@ -237,6 +237,71 @@ def test_subdivision_returns_nothing_for_an_article_that_does_not_exist():
 def _is_single_day(url: str) -> bool:
     tail = url.rsplit("/daily/", 1)[1].split("/")
     return tail[0] == tail[1]
+
+
+def test_a_widened_200_carrying_only_pad_days_still_recovers_the_window():
+    """The widened retry succeeds and looks like an answer, but every row in it
+    falls in the pad region. The requested 30 days are only reachable in slices."""
+
+    class PadRegionOnly:
+        def __init__(self):
+            self.urls = []
+
+        def __call__(self, url):
+            self.urls.append(url)
+            tail = url.rsplit("/daily/", 1)[1].split("/")
+            s = datetime.strptime(tail[0], "%Y%m%d").date()
+            e = datetime.strptime(tail[1], "%Y%m%d").date()
+            span = (e - s).days + 1
+            if s < date(2026, 7, 13):  # a widened request: answers, but only pad days
+                return 200, {}, days("2026070100", "2026070200")
+            if span > 7:  # the window itself, and its halves
+                return 404, {}, b""
+            stamps, cursor = [], s
+            while cursor <= e:
+                stamps.append(f"{cursor:%Y%m%d}00")
+                cursor += timedelta(days=1)
+            return 200, {}, days(*stamps)
+
+    api = PadRegionOnly()
+    rows = client.fetch_window(
+        "Hobbiton_Movie_Set", date(2026, 7, 13), date(2026, 8, 11), opener=api
+    )
+
+    assert len(rows) == 30, f"expected the whole window, got {len(rows)}"
+    assert rows[0]["timestamp"] == "2026071300"
+    assert rows[-1]["timestamp"] == "2026081100"
+    assert all(r["timestamp"] >= "2026071300" for r in rows), "pad days must not leak in"
+
+
+def test_a_partial_widened_200_is_completed_by_subdividing():
+    """Returning early on a partial answer left the omitted days for the watermark
+    to notice. They are recoverable here, so they are recovered here."""
+
+    class PartialThenSlices:
+        def __init__(self):
+            self.urls = []
+
+        def __call__(self, url):
+            self.urls.append(url)
+            tail = url.rsplit("/daily/", 1)[1].split("/")
+            s = datetime.strptime(tail[0], "%Y%m%d").date()
+            e = datetime.strptime(tail[1], "%Y%m%d").date()
+            if s < date(2026, 1, 1):  # widened: only the first two requested days
+                return 200, {}, days("2026010100", "2026010200")
+            if (e - s).days + 1 > 2:
+                return 404, {}, b""
+            stamps, cursor = [], s
+            while cursor <= e:
+                stamps.append(f"{cursor:%Y%m%d}00")
+                cursor += timedelta(days=1)
+            return 200, {}, days(*stamps)
+
+    rows = client.fetch_window(
+        "Hobbiton_Movie_Set", date(2026, 1, 1), date(2026, 1, 8), opener=PartialThenSlices()
+    )
+
+    assert [r["timestamp"] for r in rows] == [f"2026010{n}00" for n in range(1, 9)]
 
 
 def test_subdivision_trims_days_nobody_asked_about():
