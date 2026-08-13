@@ -22,7 +22,7 @@ pip install -r requirements.txt
 
 python demo.py        # offline, synthetic API, no network needed
 python -m src         # live, hits the Wikimedia API
-pytest -q             # 65 tests, all offline
+pytest -q             # 72 tests, all offline
 ```
 
 `demo.py` output:
@@ -34,8 +34,12 @@ run 2 (three days later)   ok     requests=8   fetched=24   loaded=24   quaranti
 744 rows, 0 duplicate (venue, date) pairs
 ```
 
-Run 2 asked for 8 requests instead of 24 because seven of the eight venues were
-already current up to their watermark. That is the whole point of the watermark.
+All eight venues ask in both runs. Run 1 backfills 90 days, which is three
+30 day windows each, so 24 requests. Run 2 happens three days later and each
+venue needs only the three days since its watermark — one window each, so eight
+requests and 24 rows instead of 720. That is the whole point of the watermark:
+not that venues drop out, but that the range each one asks for collapses to what
+it has not already seen.
 
 ## Six decisions worth arguing about
 
@@ -70,6 +74,12 @@ requests. An article that genuinely does not exist answers 404 at every width
 and every slice, down to single days, which is what stops this from inventing
 data.
 
+A 200 gets no more benefit of the doubt than the 404 did. If the widened retry
+succeeds but mentions none of the days actually asked for, that is not an answer
+about those days, and subdividing goes ahead anyway. Believing it would be the
+worse mistake of the two: an empty list reads to the caller as a verified-quiet
+window, and the watermark would step over the lot.
+
 **2. Retry 429 and 5xx. Never retry 400.**
 A malformed request will be malformed on the retry too, so retrying it only
 burns someone else's rate limit. Backoff honours `Retry-After` when the server
@@ -88,6 +98,9 @@ put — so the days are asked for again tomorrow rather than lost.
 `EXPECTED_FIELDS` is the contract. If the API drops a field, the run fails with
 the field name in the message. The alternative is that the field silently
 becomes NULL and surfaces three tables downstream as a chart with a gap in it.
+An item that is not an object at all — a bare number where a row should be —
+is the same failure and gets the same named error, rather than a `TypeError`
+thrown from inside a set operation with nothing in it to say which article.
 
 **4. Bad rows are quarantined, not dropped — and the watermark respects that.**
 Every rejected row lands in `quarantine` with the rule it broke and its raw
@@ -184,16 +197,18 @@ Applied per row, in this order:
 
 ## Testing
 
-65 tests, no network. The HTTP call is injected into `fetch_window` and the
+72 tests, no network. The HTTP call is injected into `fetch_window` and the
 fetcher is injected into `ingest.run`, so the suite drives real code paths with
 stubbed transport rather than mocking out the logic being tested.
 
 Covered: URL quoting for titles like `Sky_Tower_(Auckland)`, 404 verified before
 it is believed and accepted as empty only when every widening and every slice
-agrees, a window that answers only in slices stitched back together in order,
-subdivision recursing only into the pieces that failed, recovered rows trimmed
-to the requested window, unparseable timestamps left for quarantine rather than
-dropped in the trim, `Retry-After` honoured, backoff growth, give-up
+agrees, a widened 200 that mentions none of the requested days subdivided rather
+than believed, a window that answers only in slices stitched back together in
+order, subdivision recursing only into the pieces that failed, recovered rows
+trimmed to the requested window on both paths, an item that is not an object
+raising schema drift by name, unparseable timestamps left for quarantine rather
+than dropped in the trim, `Retry-After` honoured, backoff growth, give-up
 after max attempts, 400 not retried, both schema drift cases, every acceptance
 rule, window tiling with no gap or overlap, watermark resume, idempotent re-run,
 restatement overwrite, a gate failure leaving the warehouse untouched and still

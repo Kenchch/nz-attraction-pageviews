@@ -132,13 +132,42 @@ def test_verification_falls_through_to_the_second_pad():
     assert len(opener.urls) == 3
 
 
-def test_wider_window_with_nothing_in_range_is_still_empty():
+def test_wider_window_never_returns_days_outside_the_request():
     """Verification must not invent rows the requested window did not ask for."""
-    opener = Opener((404, {}, b""), (200, {}, days("2025120100", "2025120200")))
+    opener = Opener(
+        (404, {}, b""),
+        (200, {}, days("2025120100", "2026010200", "2026010300")),
+    )
     rows = client.fetch_window(
         "Hobbiton_Movie_Set", date(2026, 1, 1), date(2026, 1, 5), opener=opener
     )
-    assert rows == []
+    assert [r["timestamp"] for r in rows] == ["2026010200", "2026010300"]
+
+
+def test_a_wider_200_that_skips_every_requested_day_is_not_believed():
+    """The premise of this module is that whether a response contains the days you
+    asked for depends on the shape of the request. A 200 that mentions none of
+    them is no more an answer about them than the 404 was - and trusting it is
+    worse, because the caller reads empty as verified-quiet and advances its
+    watermark over the lot."""
+    opener = Opener((404, {}, b""), (200, {}, days("2025120100", "2025120200")))
+
+    client.fetch_window("Hobbiton_Movie_Set", date(2026, 1, 1), date(2026, 1, 5), opener=opener)
+
+    assert len(opener.urls) > 1 + len(client.VERIFY_PADS), (
+        "an empty trim should fall through to subdividing, not be taken as proof"
+    )
+
+
+def test_a_wider_200_that_skips_the_days_still_finds_them_by_subdividing():
+    api = WidthSensitiveApi(max_span_days=2)
+    rows = client.fetch_window("Hobbiton_Movie_Set", date(2026, 1, 1), date(2026, 1, 4), opener=api)
+    assert [r["timestamp"] for r in rows] == [
+        "2026010100",
+        "2026010200",
+        "2026010300",
+        "2026010400",
+    ]
 
 
 def test_verification_keeps_unparseable_timestamps_for_quarantine():
@@ -208,6 +237,23 @@ def test_subdivision_returns_nothing_for_an_article_that_does_not_exist():
 def _is_single_day(url: str) -> bool:
     tail = url.rsplit("/daily/", 1)[1].split("/")
     return tail[0] == tail[1]
+
+
+def test_subdivision_trims_days_nobody_asked_about():
+    """A slice can answer with days outside its own range. The two verification
+    paths should not disagree about what this function may return."""
+
+    class Sloppy:
+        def __call__(self, url):
+            tail = url.rsplit("/daily/", 1)[1].split("/")
+            if tail[0] == tail[1]:  # single day: answer, but add a stray
+                return 200, {}, days(tail[0] + "00", "20200101" + "00")
+            return 404, {}, b""
+
+    rows = client.fetch_window(
+        "Hobbiton_Movie_Set", date(2026, 1, 1), date(2026, 1, 2), opener=Sloppy()
+    )
+    assert [r["timestamp"] for r in rows] == ["2026010100", "2026010200"]
 
 
 def test_subdivision_only_recurses_into_the_pieces_that_failed():
@@ -302,4 +348,13 @@ def test_missing_field_raises_schema_drift():
 def test_missing_items_key_raises_schema_drift():
     opener = Opener((200, {}, b'{"result": []}'))
     with pytest.raises(client.SchemaDriftError, match="no 'items' key"):
+        client.fetch_window("Milford_Sound", date(2026, 1, 1), date(2026, 1, 1), opener=opener)
+
+
+@pytest.mark.parametrize("item", ["5", "null", '"a string"', "[]"])
+def test_non_object_item_raises_schema_drift_not_a_bare_typeerror(item):
+    """The module promises schema drift is raised loudly and by name. A TypeError
+    from inside a set operation is neither."""
+    opener = Opener((200, {}, b'{"items": [%s]}' % item.encode()))
+    with pytest.raises(client.SchemaDriftError, match="expected an object"):
         client.fetch_window("Milford_Sound", date(2026, 1, 1), date(2026, 1, 1), opener=opener)

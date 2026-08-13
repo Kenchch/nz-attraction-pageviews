@@ -129,6 +129,10 @@ def _parse(body: bytes, article: str) -> list[dict]:
         raise SchemaDriftError(f"{article}: 'items' is {type(items).__name__}, expected list")
 
     for item in items:
+        if not isinstance(item, dict):
+            # Without this the field check below raises a bare TypeError from
+            # somewhere inside a set operation, which is neither loud nor named.
+            raise SchemaDriftError(f"{article}: item is {type(item).__name__}, expected an object")
         missing = EXPECTED_FIELDS - set(item)
         if missing:
             raise SchemaDriftError(f"{article}: item missing fields {sorted(missing)}")
@@ -260,7 +264,21 @@ def fetch_window(
             max_attempts=max_attempts,
             sleep=sleep,
         )
-        if widened is not None:
-            return [item for item in widened if _within(item, start, end)]
+        if widened is None:
+            continue
+        in_range = [item for item in widened if _within(item, start, end)]
+        if in_range:
+            return in_range
+        # A 200 that does not mention a single day we asked about is not an
+        # answer about those days. Trusting it here would be the same mistake as
+        # trusting the 404, and a worse one: the caller reads an empty list as a
+        # verified-quiet window and advances its watermark over the lot. Whether
+        # a response contains the days you asked for depends on the shape of the
+        # request, which is the premise this whole module is built on.
+        break
 
-    return _subdivide(article, start, end, opener=opener, max_attempts=max_attempts, sleep=sleep)
+    found = _subdivide(article, start, end, opener=opener, max_attempts=max_attempts, sleep=sleep)
+    # Trimmed on the way out for the same reason the widened path is: a slice can
+    # answer with days nobody asked about, and the two paths should not disagree
+    # about what this function is allowed to return.
+    return [item for item in found if _within(item, start, end)]
