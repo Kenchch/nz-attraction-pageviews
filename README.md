@@ -22,7 +22,7 @@ pip install -r requirements.txt
 
 python demo.py        # offline, synthetic API, no network needed
 python -m src         # live, hits the Wikimedia API
-pytest -q             # 55 tests, all offline
+pytest -q             # 58 tests, all offline
 ```
 
 `demo.py` output:
@@ -95,10 +95,18 @@ of 30. If its watermark then advanced to the end of the range anyway, those 10
 days would never be requested again and the quarantine would be a record of data
 permanently lost — quarantine with the outcome of a drop.
 
-So a venue advances its watermark only across the unbroken run of days it
-actually loaded, and stops at the first gap. Next run resumes there and has
-another go. A venue with nothing rejected advances to the end of its range,
-including a window that came back genuinely empty, which is what keeps a quiet
+The same hole opens without any rejected row at all. If the API answers 200 and
+just does not mention the last three days, nothing is quarantined — the
+acceptance criteria only judge rows that turned up — and the watermark would
+still march to the end of the range. That is what a publication lag longer than
+`PUBLICATION_LAG_DAYS` looks like, and two days is an assumption about Wikimedia,
+not a promise from it.
+
+So the watermark moves across days it can account for and stops at the first day
+it cannot, whether that day was quarantined or simply never arrived. Next run
+resumes there and tries again. A day in a window that came back *genuinely* empty
+does count as accounted for, because decision 1 only reports empty after widening
+and subdividing — that is an answer, not an absence, and it is what keeps a quiet
 venue from being re-requested forever.
 
 **5. The gate runs before the load, not after.**
@@ -166,7 +174,7 @@ Applied per row, in this order:
 
 ## Testing
 
-55 tests, no network. The HTTP call is injected into `fetch_window` and the
+58 tests, no network. The HTTP call is injected into `fetch_window` and the
 fetcher is injected into `ingest.run`, so the suite drives real code paths with
 stubbed transport rather than mocking out the logic being tested.
 
@@ -180,16 +188,21 @@ after max attempts, 400 not retried, both schema drift cases, every acceptance
 rule, window tiling with no gap or overlap, watermark resume, idempotent re-run,
 restatement overwrite, a gate failure leaving the warehouse untouched and still
 logging the rate that failed it, the watermark refusing to step over a
-quarantined day while a later run recovers it, quarantined rows carrying the day
-they belong to (and a null day when that is the defect), and the lookback cap
-bounding a stuck venue while recording what it gave up on.
+quarantined day, over a day missing from the tail of a 200, or over a hole in the
+middle of one — while a later run recovers all three — quarantined rows carrying
+the day they belong to (and a null day when that is the defect), and the lookback
+cap bounding a stuck venue while recording what it gave up on.
 
 CI runs lint, format check, and tests on Python 3.10 through 3.13.
 
 ## Limits
 
 - Pageviews measure interest, not attendance. Do not read them as visitor numbers.
-- Wikimedia publishes with a lag, so the job stops two days short of today.
+- Wikimedia publishes with a lag, so the job stops two days short of today. Two
+  is a guess at a normal day, not a guarantee; during an incident the lag can be
+  longer. The watermark absorbs that rather than depending on the guess being
+  right — it stops at the last day the API actually returned, so a longer lag
+  costs a re-request next run instead of a permanent hole.
 - Runs are sequential. Eight venues is small enough that concurrency would add
   more failure modes than it removes wall clock.
 - Verifying a 404 is not free, and the bill scales with how wrong the API is
