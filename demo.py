@@ -13,7 +13,7 @@ import random
 import zlib
 from datetime import date, timedelta
 
-from src import ingest
+from nz_attraction_pageviews import ingest
 
 DB = "demo.duckdb"
 RUN_1_DAY = date(2026, 3, 1)

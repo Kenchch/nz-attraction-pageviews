@@ -6,7 +6,7 @@ from datetime import date, timedelta
 
 import pytest
 
-from src import client, ingest, quality
+from nz_attraction_pageviews import client, ingest, quality
 
 TODAY = date(2026, 3, 1)
 VENUES = [
@@ -328,32 +328,104 @@ def test_days_absent_from_a_200_are_picked_up_once_they_publish(con):
     assert ingest.get_watermark(con, "milford-sound") == end
 
 
-def test_a_hole_in_the_middle_of_a_200_stops_the_watermark(con):
-    """Not only the tail. A day missing from the middle is just as unaccounted for."""
+def test_a_hole_behind_a_day_that_arrived_is_trusted_as_quiet(con):
+    """The API omits days with no traffic rather than sending a zero, so a hole is
+    ambiguous. A later day arriving settles it: publication runs in date order, so
+    the earlier day was published and its absence can only mean nobody looked."""
     end = TODAY - timedelta(days=ingest.PUBLICATION_LAG_DAYS)
     hole = end - timedelta(days=5)
 
     ingest.run(
-        con,
-        VENUES,
-        today=TODAY,
-        backfill_days=10,
-        chunk_days=30,
-        fetch=Laggy(end, skip=[hole]),
+        con, VENUES, today=TODAY, backfill_days=10, chunk_days=30, fetch=Laggy(end, skip=[hole])
     )
 
-    assert ingest.get_watermark(con, "milford-sound") == hole - timedelta(days=1)
+    assert ingest.get_watermark(con, "milford-sound") == end, (
+        "days after the hole arrived, so the hole is settled and must not stall the venue"
+    )
+    assert (
+        con.execute(
+            "SELECT count(*) FROM pageviews WHERE venue_id = 'milford-sound' AND view_date = ?",
+            [hole],
+        ).fetchone()[0]
+        == 0
+    )
 
 
-def test_empty_window_still_advances_the_watermark(con):
-    """A genuinely quiet venue must not be re-requested forever."""
+def test_an_absent_day_is_trusted_once_it_is_old_enough(con):
+    """Nothing arrives after it to settle it, so only age can."""
+    end = TODAY - timedelta(days=ingest.PUBLICATION_LAG_DAYS)
+    published_to = TODAY - timedelta(days=10)
+
+    ingest.run(con, VENUES, today=TODAY, backfill_days=20, chunk_days=30, fetch=Laggy(published_to))
+
+    trust_line = TODAY - timedelta(days=ingest.TRUST_LAG_DAYS)
+    assert ingest.get_watermark(con, "milford-sound") == trust_line, (
+        "absent days older than the trust lag are quiet; newer ones stay unsettled"
+    )
+    assert trust_line < end
+
+
+def test_a_quiet_venue_is_not_dragged_backwards(con):
+    """A venue already current past the trust line must not be pulled back to it."""
+    ingest.run(con, VENUES, today=TODAY, backfill_days=10, chunk_days=30, fetch=Recorder())
+    end = TODAY - timedelta(days=ingest.PUBLICATION_LAG_DAYS)
+    assert ingest.get_watermark(con, "milford-sound") == end
 
     def nothing(article, start, end):
         return []
 
     ingest.run(con, VENUES, today=TODAY, backfill_days=10, chunk_days=30, fetch=nothing)
-    expected_end = TODAY - timedelta(days=ingest.PUBLICATION_LAG_DAYS)
-    assert ingest.get_watermark(con, "milford-sound") == expected_end
+
+    assert ingest.get_watermark(con, "milford-sound") == end, "the watermark must not go backwards"
+
+
+def test_a_sparse_venue_still_makes_progress(con):
+    """Measured against the live API, `Te_Rerenga_Wairua` has 74 absent days in 90.
+    Treating every absent day as unsettled would strand a venue like that."""
+    end = TODAY - timedelta(days=ingest.PUBLICATION_LAG_DAYS)
+    busy = {end - timedelta(days=n) for n in range(0, 90, 3)}
+
+    def sparse(article, start, end):
+        rows, cursor = [], start
+        while cursor <= end:
+            if cursor in busy:
+                rows.append(
+                    {
+                        "project": "en.wikipedia",
+                        "article": article,
+                        "granularity": "daily",
+                        "timestamp": f"{cursor:%Y%m%d}00",
+                        "access": "all-access",
+                        "agent": "user",
+                        "views": 3,
+                    }
+                )
+            cursor += timedelta(days=1)
+        return rows
+
+    ingest.run(con, VENUES, today=TODAY, backfill_days=90, chunk_days=30, fetch=sparse)
+    first = ingest.get_watermark(con, "milford-sound")
+
+    later = TODAY + timedelta(days=7)
+    ingest.run(con, VENUES, today=later, backfill_days=90, chunk_days=30, fetch=sparse)
+
+    assert first is not None
+    assert ingest.get_watermark(con, "milford-sound") > first, "a quiet venue must still advance"
+
+
+def test_empty_window_advances_the_watermark_as_far_as_the_trust_line(con):
+    """A genuinely quiet venue must not be re-requested forever - but an empty
+    window proves nothing about days too recent to have published yet, so it
+    advances to the trust line rather than all the way to the end."""
+
+    def nothing(article, start, end):
+        return []
+
+    ingest.run(con, VENUES, today=TODAY, backfill_days=10, chunk_days=30, fetch=nothing)
+
+    assert ingest.get_watermark(con, "milford-sound") == TODAY - timedelta(
+        days=ingest.TRUST_LAG_DAYS
+    )
 
 
 def test_quarantine_row_carries_the_day_it_belongs_to(con):
@@ -555,6 +627,52 @@ def test_venue_already_current_makes_no_request(con):
     summary = ingest.run(con, VENUES, today=TODAY, backfill_days=5, chunk_days=30, fetch=idle)
     assert idle.calls == []
     assert summary.requests == 0
+
+
+def write_csv(tmp_path, text):
+    path = tmp_path / "venues.csv"
+    path.write_text(text, encoding="utf-8")
+    return path
+
+
+def test_read_venues_survives_the_bom_excel_writes(tmp_path):
+    """A BOM rides along inside the first column name, so `venue_id` goes missing."""
+    path = tmp_path / "venues.csv"
+    path.write_bytes(b"\xef\xbb\xbfvenue_id,venue_name,region,wiki_article\na,A,R,Article_A\n")
+    assert ingest.read_venues(path)[0].venue_id == "a"
+
+
+def test_read_venues_tolerates_an_extra_column(tmp_path):
+    path = write_csv(
+        tmp_path,
+        "venue_id,venue_name,region,wiki_article,notes\na,A,R,Article_A,mine\n",
+    )
+    assert ingest.read_venues(path)[0].wiki_article == "Article_A"
+
+
+def test_read_venues_names_the_missing_column(tmp_path):
+    path = write_csv(tmp_path, "venue_id,venue_name,region\na,A,R\n")
+    with pytest.raises(ValueError, match="wiki_article"):
+        ingest.read_venues(path)
+
+
+def test_read_venues_reports_the_line_of_a_blank_field(tmp_path):
+    path = write_csv(
+        tmp_path,
+        "venue_id,venue_name,region,wiki_article\na,A,R,Article_A\nb,B,R,\n",
+    )
+    with pytest.raises(ValueError, match="line 3"):
+        ingest.read_venues(path)
+
+
+def test_read_venues_rejects_a_duplicate_venue_id(tmp_path):
+    """Two rows sharing a venue_id would silently share a watermark."""
+    path = write_csv(
+        tmp_path,
+        "venue_id,venue_name,region,wiki_article\na,A,R,Article_A\na,B,R,Article_B\n",
+    )
+    with pytest.raises(ValueError, match="duplicate venue_id"):
+        ingest.read_venues(path)
 
 
 def test_read_venues_parses_the_shipped_csv():

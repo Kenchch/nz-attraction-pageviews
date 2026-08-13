@@ -1,4 +1,4 @@
-"""Entry point: python -m src
+"""Entry point: python -m nz_attraction_pageviews
 
 Reads venues.csv, ingests into warehouse.duckdb, prints the run summary.
 Safe to run repeatedly. The second run only asks for days it has not seen.

@@ -7,7 +7,7 @@ from datetime import date, datetime, timedelta
 
 import pytest
 
-from src import client
+from nz_attraction_pageviews import client
 
 
 def canned(views: int = 100) -> bytes:

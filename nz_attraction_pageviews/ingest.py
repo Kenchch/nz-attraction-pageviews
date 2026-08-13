@@ -43,6 +43,21 @@ DEFAULT_MAX_LOOKBACK_DAYS = 180
 # which is not an error but does waste a request on every run.
 PUBLICATION_LAG_DAYS = 2
 
+# How old an absent day must be before we believe it was genuinely quiet.
+#
+# The API omits days with no traffic rather than sending a zero, so an absent day
+# means either "nobody looked" or "not published yet" - and no amount of asking
+# can tell those apart, because an unpublished day 404s at every width and every
+# slice just like a quiet one. Only time separates them. Below this age an absent
+# day is treated as unsettled and re-asked next run; above it, as quiet.
+#
+# The cost is that every venue re-asks for its last few days each night. The
+# alternative is picking one meaning and being silently wrong: believing "quiet"
+# loses days whenever the lag runs long, and believing "unpublished" strands any
+# venue quiet enough to have a gap - measured against the live API,
+# `Te_Rerenga_Wairua` has 74 absent days in 90.
+TRUST_LAG_DAYS = 7
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS pageviews (
     venue_id    VARCHAR NOT NULL,
@@ -126,12 +141,48 @@ def connect(db_path: str | Path) -> duckdb.DuckDBPyConnection:
     return con
 
 
+VENUE_COLUMNS = ("venue_id", "venue_name", "region", "wiki_article")
+
+
 def read_venues(path: str | Path) -> list[Venue]:
-    with open(path, newline="", encoding="utf-8") as handle:
-        rows = list(csv.DictReader(handle))
-    if not rows:
+    """Parse venues.csv, complaining with a line number when it cannot.
+
+    This file is hand-edited, often in a spreadsheet, so it is the most likely
+    thing in the project to be wrong. `Venue(**row)` turned every mistake into
+    the same unhelpful TypeError from the dataclass constructor, naming a keyword
+    rather than a line. utf-8-sig rather than utf-8 because Excel writes a BOM,
+    which would otherwise ride along inside the first column name and make
+    `venue_id` mysteriously missing.
+    """
+    with open(path, newline="", encoding="utf-8-sig") as handle:
+        reader = csv.DictReader(handle)
+        header = reader.fieldnames or []
+        missing = [column for column in VENUE_COLUMNS if column not in header]
+        if missing:
+            raise ValueError(f"{path}: missing column(s) {missing}; found {header}")
+
+        venues: list[Venue] = []
+        seen: dict[str, int] = {}
+        for line, row in enumerate(reader, start=2):
+            fields = {column: (row.get(column) or "").strip() for column in VENUE_COLUMNS}
+            blank = [column for column, value in fields.items() if not value]
+            if blank:
+                raise ValueError(f"{path} line {line}: empty {blank}")
+
+            venue_id = fields["venue_id"]
+            if venue_id in seen:
+                raise ValueError(
+                    f"{path} line {line}: duplicate venue_id {venue_id!r}, "
+                    f"already used on line {seen[venue_id]}"
+                )
+            seen[venue_id] = line
+            # Only the four columns we know about, so an extra one someone added
+            # for their own notes is tolerated rather than fatal.
+            venues.append(Venue(**fields))
+
+    if not venues:
         raise ValueError(f"{path} has no venues")
-    return [Venue(**row) for row in rows]
+    return venues
 
 
 def plan_windows(start: date, end: date, chunk_days: int) -> list[tuple[date, date]]:
@@ -160,41 +211,53 @@ def start_date_for(con, venue: Venue, end: date, backfill_days: int) -> date:
     return watermark + timedelta(days=1)
 
 
-def _days(start: date, end: date):
-    cursor = start
-    while cursor <= end:
-        yield cursor
-        cursor += timedelta(days=1)
+def _venue_watermark(
+    start: date,
+    end: date,
+    venue_clean: list[quality.CleanRow],
+    venue_bad: list[quality.BadRow],
+    trusted_end: date,
+) -> date | None:
+    """How far this venue may advance. None means leave the watermark alone.
 
+    The watermark promises that every day up to it has been dealt with, so it may
+    not step over a day we failed to load. Two kinds of day fail that test, and
+    they need opposite treatment.
 
-def _venue_watermark(start: date, end: date, covered: set[date]) -> date | None:
-    """How far this venue may advance. None means leave the watermark where it is.
+    A quarantined day is a hard stop, whatever its age. The row is in
+    `quarantine`, but the gate is a rate across every venue, so one venue's bad
+    patch can sit under the threshold and pass; advancing anyway would turn the
+    quarantine into a record of data we permanently lost. The watermark therefore
+    stops the day before the earliest rejected one.
 
-    The watermark is a promise that every day up to it has been dealt with, so it
-    may only move across days we can actually account for. It stops at the first
-    day we cannot, and the next run resumes there and tries again.
+    An *absent* day is the ambiguous one, because the API omits days with no
+    traffic instead of sending a zero. Absent means "quiet" or "not published
+    yet" and nothing in the response distinguishes them. Two things do:
 
-    Three ways a day fails to be accounted for, all of which used to be silent:
-
-    - Its row was quarantined. The row is in `quarantine`, but the gate is a rate
-      across every venue, so one venue's bad patch can sit under the threshold
-      and pass. Advancing anyway would make the quarantine a record of data we
-      permanently lost.
-    - The API answered 200 and simply did not mention the day. Nothing is
-      rejected, because the acceptance criteria only judge rows that turned up.
-      This is what a publication lag longer than PUBLICATION_LAG_DAYS looks like,
-      and the lag is an assumption, not a guarantee.
-    - The day is in a window that came back genuinely empty. This one *is*
-      accounted for: `client.fetch_window` only reports empty after widening and
-      subdividing, so it is a real answer rather than an absence, and the day
-      counts as covered. Otherwise a quiet venue would be re-requested forever.
+    - Anything before a day that did arrive is settled. Publication runs in date
+      order, so a later day arriving proves the earlier one was published, and
+      absence there can only mean quiet. Hence the watermark may always advance
+      to the last day actually loaded, holes behind it included.
+    - Past that, only age helps. An absent day older than `trusted_end` is taken
+      as quiet; a more recent one is left alone and asked for again next run,
+      which is what stops a long publication lag becoming a permanent hole.
     """
-    frontier = None
-    for day in _days(start, end):
-        if day not in covered:
-            break
-        frontier = day
-    return frontier
+    if any(row.view_date is None for row in venue_bad):
+        # A row rejected by `timestamp_parses` cannot be pinned to a day, so we
+        # cannot know which day to stop before. Advancing past an unknown day is
+        # the one thing we must not do.
+        return None
+
+    ceiling = end
+    if venue_bad:
+        ceiling = min(row.view_date for row in venue_bad) - timedelta(days=1)
+
+    trusted = min(end, trusted_end)
+    loaded = [row.view_date for row in venue_clean]
+    frontier = max(max(loaded), trusted) if loaded else trusted
+
+    frontier = min(frontier, ceiling)
+    return frontier if frontier >= start else None
 
 
 def run(
@@ -206,11 +269,13 @@ def run(
     backfill_days: int = DEFAULT_BACKFILL_DAYS,
     max_reject_rate: float = DEFAULT_MAX_REJECT_RATE,
     max_lookback_days: int = DEFAULT_MAX_LOOKBACK_DAYS,
+    trust_lag_days: int = TRUST_LAG_DAYS,
     fetch=client.fetch_window,
 ) -> RunSummary:
     today = today or datetime.now(UTC).date()
     end = today - timedelta(days=PUBLICATION_LAG_DAYS)
     floor = end - timedelta(days=max_lookback_days - 1)
+    trusted_end = today - timedelta(days=trust_lag_days)
 
     run_id = uuid.uuid4().hex[:12]
     started_at = datetime.now(UTC)
@@ -232,7 +297,8 @@ def run(
             if start > end:
                 continue  # already current, nothing to ask for
 
-            covered: set[date] = set()
+            venue_clean: list[quality.CleanRow] = []
+            venue_bad: list[quality.BadRow] = []
 
             for window_start, window_end in plan_windows(start, end, chunk_days):
                 items = fetch(venue.wiki_article, window_start, window_end)
@@ -247,21 +313,18 @@ def run(
                     end=window_end,
                     today=today,
                 )
-                clean.extend(good)
-                bad.extend(rejected)
+                venue_clean.extend(good)
+                venue_bad.extend(rejected)
 
-                if items:
-                    # The API spoke for this window, so it has spoken only for the
-                    # days it actually mentioned. Days it left out are not covered,
-                    # whatever the reason.
-                    covered.update(row.view_date for row in good)
-                else:
-                    # Empty, and `fetch` only says that after widening and
-                    # subdividing, so it is an answer about the whole window.
-                    covered.update(_days(window_start, window_end))
+            clean.extend(venue_clean)
+            bad.extend(venue_bad)
 
-            frontier = _venue_watermark(start, end, covered)
-            if frontier is not None:
+            frontier = _venue_watermark(start, end, venue_clean, venue_bad, trusted_end)
+            # Never move a watermark backwards. A venue already current past the
+            # trust line would otherwise be dragged back to it and re-fetch the
+            # same days every night.
+            current = get_watermark(con, venue.venue_id)
+            if frontier is not None and (current is None or frontier > current):
                 new_watermarks[venue.venue_id] = frontier
 
         summary.rows_quarantined = len(bad)
