@@ -32,6 +32,7 @@ class CleanRow:
 class BadRow:
     venue_id: str
     article: str
+    view_date: date | None
     rule: str
     detail: str
     raw: str
@@ -43,6 +44,18 @@ def parse_timestamp(value) -> date:
     if len(text) != 10 or not text.isdigit():
         raise ValueError(f"expected 10-digit YYYYMMDD00, got {value!r}")
     return datetime.strptime(text[:8], "%Y%m%d").date()
+
+
+def _date_or_none(item: dict) -> date | None:
+    """The row's day, or None when that is exactly what is wrong with it.
+
+    A row rejected by `timestamp_parses` has no day to record, which is why
+    `quarantine.view_date` is nullable.
+    """
+    try:
+        return parse_timestamp(item["timestamp"])
+    except (ValueError, KeyError, TypeError):
+        return None
 
 
 def check_window(
@@ -65,7 +78,7 @@ def check_window(
         )
         if broken is not None:
             rule, detail = broken
-            bad.append(BadRow(venue_id, article, rule, detail, repr(item)))
+            bad.append(BadRow(venue_id, article, _date_or_none(item), rule, detail, repr(item)))
             continue
 
         view_date = parse_timestamp(item["timestamp"])
@@ -116,11 +129,22 @@ def _first_broken_rule(
     return None
 
 
-def enforce_gate(fetched: int, quarantined: int, max_reject_rate: float) -> float:
-    """Raise if too much of the run was rejected. Returns the rate when it passes."""
+def reject_rate(fetched: int, quarantined: int) -> float:
+    """The run's reject rate. Separate from the gate so it can be recorded first.
+
+    `run_log.reject_rate` is the column you reach for when a run has gone wrong,
+    so it must be written before the gate is allowed to raise. Deriving it from
+    the gate's return value meant a failed run logged 0.0 - zero in the one case
+    the number was worth having.
+    """
     if fetched == 0:
         return 0.0
-    rate = quarantined / fetched
+    return quarantined / fetched
+
+
+def enforce_gate(fetched: int, quarantined: int, max_reject_rate: float) -> float:
+    """Raise if too much of the run was rejected. Returns the rate when it passes."""
+    rate = reject_rate(fetched, quarantined)
     if rate > max_reject_rate:
         raise QualityGateFailed(
             f"rejected {quarantined}/{fetched} rows ({rate:.2%}), "

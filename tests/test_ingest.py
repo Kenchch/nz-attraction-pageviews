@@ -278,6 +278,135 @@ def test_empty_window_still_advances_the_watermark(con):
     assert ingest.get_watermark(con, "milford-sound") == expected_end
 
 
+def test_quarantine_row_carries_the_day_it_belongs_to(con):
+    end = TODAY - timedelta(days=ingest.PUBLICATION_LAG_DAYS)
+    bad_day = end - timedelta(days=4)
+
+    ingest.run(
+        con,
+        VENUES,
+        today=TODAY,
+        backfill_days=10,
+        chunk_days=30,
+        max_reject_rate=1.0,
+        fetch=Poisoner("Milford_Sound", [bad_day]),
+    )
+
+    row = con.execute("SELECT venue_id, view_date, rule FROM quarantine").fetchone()
+    assert row == ("milford-sound", bad_day, "views_non_negative")
+
+
+def test_repeated_quarantine_of_one_day_is_countable_as_one_day(con):
+    """A stuck day is re-quarantined every run, so the diagnostic query has to
+    count distinct days rather than rows or it reads as a worsening problem."""
+    end = TODAY - timedelta(days=ingest.PUBLICATION_LAG_DAYS)
+    bad_day = end - timedelta(days=4)
+    fetch = Poisoner("Milford_Sound", [bad_day])
+
+    for _ in range(3):
+        ingest.run(
+            con,
+            VENUES,
+            today=TODAY,
+            backfill_days=10,
+            chunk_days=30,
+            max_reject_rate=1.0,
+            fetch=fetch,
+        )
+
+    rows, bad_days = con.execute("""
+        SELECT count(*), count(DISTINCT (venue_id, view_date)) FROM quarantine
+    """).fetchone()
+    assert rows == 3
+    assert bad_days == 1, "three runs, but still only one bad day"
+
+
+def test_failed_gate_still_records_the_rate_that_failed_it(con):
+    """reject_rate is the column you reach for when a run went wrong. Deriving it
+    from the gate's return value logged 0.0 for exactly the runs that needed it."""
+
+    def poisoned(article, start, end):
+        return [
+            {
+                "project": "en.wikipedia",
+                "article": article,
+                "granularity": "daily",
+                "timestamp": f"{start:%Y%m%d}00",
+                "access": "all-access",
+                "agent": "user",
+                "views": -5,
+            }
+        ]
+
+    with pytest.raises(quality.QualityGateFailed):
+        ingest.run(con, VENUES, today=TODAY, backfill_days=5, chunk_days=30, fetch=poisoned)
+
+    status, rate = con.execute("SELECT status, reject_rate FROM run_log").fetchone()
+    assert status == "failed"
+    assert rate == 1.0
+
+
+def test_lookback_is_capped_and_the_giving_up_is_recorded(con):
+    """A venue stuck on a bad day would otherwise ask for a range that grows
+    every night, for ever."""
+    end = TODAY - timedelta(days=ingest.PUBLICATION_LAG_DAYS)
+    con.execute(
+        "INSERT OR REPLACE INTO watermark VALUES (?, ?, current_timestamp)",
+        ["milford-sound", end - timedelta(days=400)],
+    )
+
+    fetch = Recorder()
+    summary = ingest.run(
+        con,
+        VENUES,
+        today=TODAY,
+        backfill_days=10,
+        chunk_days=400,
+        max_lookback_days=180,
+        fetch=fetch,
+    )
+
+    milford = [call for call in fetch.calls if call[0] == "Milford_Sound"]
+    assert (end - milford[0][1]).days + 1 == 180, "must not ask for more than the cap"
+    assert "milford-sound" in summary.note
+    note = con.execute("SELECT note FROM run_log").fetchone()[0]
+    assert "gave up on" in note
+
+
+def test_warehouse_from_an_older_version_is_migrated(con, tmp_path):
+    """CREATE TABLE IF NOT EXISTS leaves an existing table alone, so adding a
+    column to the DDL breaks every warehouse built before it without this."""
+    import duckdb
+
+    db = tmp_path / "old.duckdb"
+    old = duckdb.connect(str(db))
+    old.execute("""
+        CREATE TABLE quarantine (
+            run_id VARCHAR, venue_id VARCHAR, article VARCHAR,
+            rule VARCHAR, detail VARCHAR, raw VARCHAR, seen_at TIMESTAMP
+        )
+    """)
+    old.close()
+
+    migrated = ingest.connect(db)
+    try:
+        assert "view_date" in [c[0] for c in migrated.execute("DESCRIBE quarantine").fetchall()]
+
+        end = TODAY - timedelta(days=ingest.PUBLICATION_LAG_DAYS)
+        ingest.run(
+            migrated,
+            VENUES,
+            today=TODAY,
+            backfill_days=3,
+            chunk_days=30,
+            max_reject_rate=1.0,
+            fetch=Poisoner("Milford_Sound", [end]),
+        )
+        assert migrated.execute("SELECT view_date FROM quarantine").fetchone()[0] == end
+    finally:
+        migrated.close()
+
+
 def test_run_log_records_every_run(con):
     ingest.run(con, VENUES, today=TODAY, backfill_days=5, chunk_days=30, fetch=Recorder())
     row = con.execute(

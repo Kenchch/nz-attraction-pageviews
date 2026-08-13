@@ -87,6 +87,24 @@ def test_quarantined_row_keeps_the_raw_payload():
     assert "-1" in bad[0].raw
 
 
+def test_quarantined_row_records_its_day():
+    """Without this, "why is Tuesday missing" is a string match against `raw`."""
+    _, bad = check([item(timestamp="2026011500", views=-1)])
+    assert bad[0].view_date == date(2026, 1, 15)
+
+
+def test_unparseable_timestamp_quarantines_with_a_null_day():
+    """The one rejection that genuinely has no day. Hence a nullable column."""
+    _, bad = check([item(timestamp="2026-01-01")])
+    assert bad[0].rule == "timestamp_parses"
+    assert bad[0].view_date is None
+
+
+def test_reject_rate_is_available_without_the_gate():
+    assert quality.reject_rate(fetched=100, quarantined=9) == 0.09
+    assert quality.reject_rate(fetched=0, quarantined=0) == 0.0
+
+
 def test_gate_passes_under_threshold():
     assert quality.enforce_gate(fetched=100, quarantined=3, max_reject_rate=0.05) == 0.03
 

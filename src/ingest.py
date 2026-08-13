@@ -32,6 +32,13 @@ DEFAULT_CHUNK_DAYS = 30
 DEFAULT_BACKFILL_DAYS = 90
 DEFAULT_MAX_REJECT_RATE = 0.05
 
+# A venue whose watermark is stuck on a bad day asks for everything from that
+# day to today, every run, so the range and the rewrite grow without bound. This
+# caps it. Hitting the cap means giving up on the days below it, so it is not
+# free: the skipped span is written to `run_log.note` rather than passed over
+# quietly. 180 days is long enough that only a genuinely stuck venue reaches it.
+DEFAULT_MAX_LOOKBACK_DAYS = 180
+
 # The API publishes with a lag. Asking for yesterday usually returns nothing,
 # which is not an error but does waste a request on every run.
 PUBLICATION_LAG_DAYS = 2
@@ -51,6 +58,9 @@ CREATE TABLE IF NOT EXISTS quarantine (
     run_id     VARCHAR NOT NULL,
     venue_id   VARCHAR NOT NULL,
     article    VARCHAR NOT NULL,
+    -- Nullable on purpose: a row rejected by `timestamp_parses` has no day to
+    -- record. That is the one case where "which Tuesday" has no answer.
+    view_date  DATE,
     rule       VARCHAR NOT NULL,
     detail     VARCHAR,
     raw        VARCHAR,
@@ -78,6 +88,15 @@ CREATE TABLE IF NOT EXISTS run_log (
 );
 """
 
+# `CREATE TABLE IF NOT EXISTS` does nothing to a table that already exists, so a
+# warehouse built by an earlier version keeps the old shape and the next insert
+# fails on the column count. Adding the column is idempotent, and the inserts
+# name their columns, so it does not matter that the migrated column lands at the
+# end rather than in the middle where the DDL above puts it.
+MIGRATIONS = """
+ALTER TABLE quarantine ADD COLUMN IF NOT EXISTS view_date DATE;
+"""
+
 
 @dataclass(frozen=True)
 class Venue:
@@ -103,6 +122,7 @@ class RunSummary:
 def connect(db_path: str | Path) -> duckdb.DuckDBPyConnection:
     con = duckdb.connect(str(db_path))
     con.execute(SCHEMA)
+    con.execute(MIGRATIONS)
     return con
 
 
@@ -181,10 +201,12 @@ def run(
     chunk_days: int = DEFAULT_CHUNK_DAYS,
     backfill_days: int = DEFAULT_BACKFILL_DAYS,
     max_reject_rate: float = DEFAULT_MAX_REJECT_RATE,
+    max_lookback_days: int = DEFAULT_MAX_LOOKBACK_DAYS,
     fetch=client.fetch_window,
 ) -> RunSummary:
     today = today or datetime.now(UTC).date()
     end = today - timedelta(days=PUBLICATION_LAG_DAYS)
+    floor = end - timedelta(days=max_lookback_days - 1)
 
     run_id = uuid.uuid4().hex[:12]
     started_at = datetime.now(UTC)
@@ -193,10 +215,16 @@ def run(
     clean: list[quality.CleanRow] = []
     bad: list[quality.BadRow] = []
     new_watermarks: dict[str, date] = {}
+    stalled: list[str] = []
 
     try:
         for venue in venues:
             start = start_date_for(con, venue, end, backfill_days)
+            if start < floor:
+                # Stuck on a bad day for longer than we are willing to re-ask.
+                # Give up on the span below the floor, but say so out loud.
+                stalled.append(f"{venue.venue_id}: gave up on {(floor - start).days} days")
+                start = floor
             if start > end:
                 continue  # already current, nothing to ask for
 
@@ -227,9 +255,12 @@ def run(
                 new_watermarks[venue.venue_id] = frontier
 
         summary.rows_quarantined = len(bad)
-        summary.reject_rate = quality.enforce_gate(
-            summary.rows_fetched, summary.rows_quarantined, max_reject_rate
-        )
+        # Record the rate before the gate can raise, so a failed run logs the
+        # number that explains why it failed rather than 0.0.
+        summary.reject_rate = quality.reject_rate(summary.rows_fetched, summary.rows_quarantined)
+        if stalled:
+            summary.note = "; ".join(stalled)
+        quality.enforce_gate(summary.rows_fetched, summary.rows_quarantined, max_reject_rate)
 
         _load(con, run_id, clean, bad, new_watermarks)
         summary.rows_loaded = len(clean)
@@ -256,8 +287,13 @@ def _load(con, run_id, clean, bad, new_watermarks) -> None:
             )
         if bad:
             con.executemany(
-                "INSERT INTO quarantine VALUES (?, ?, ?, ?, ?, ?, ?)",
-                [(run_id, r.venue_id, r.article, r.rule, r.detail, r.raw, now) for r in bad],
+                "INSERT INTO quarantine "
+                "(run_id, venue_id, article, view_date, rule, detail, raw, seen_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                [
+                    (run_id, r.venue_id, r.article, r.view_date, r.rule, r.detail, r.raw, now)
+                    for r in bad
+                ],
             )
         if new_watermarks:
             con.executemany(

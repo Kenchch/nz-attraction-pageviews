@@ -10,6 +10,7 @@ three days it has not seen. The row count proves nothing was duplicated.
 from __future__ import annotations
 
 import random
+import zlib
 from datetime import date, timedelta
 
 from src import ingest
@@ -22,7 +23,9 @@ RUN_2_DAY = date(2026, 3, 4)
 def synthetic_api(article: str, start: date, end: date) -> list[dict]:
     """Stands in for client.fetch_window. Weekends get more traffic."""
     rows, cursor = [], start
-    base = 200 + (abs(hash(article)) % 800)
+    # crc32, not hash(): str hashing is salted per process, so hash() would make
+    # the numbers below differ on every run despite the seed above.
+    base = 200 + (zlib.crc32(article.encode()) % 800)
     while cursor <= end:
         weekend = 1.4 if cursor.weekday() >= 5 else 1.0
         rows.append(
