@@ -20,7 +20,7 @@ pip install -r requirements.txt
 
 python demo.py        # offline, synthetic API, no network needed
 python -m src         # live, hits the Wikimedia API
-pytest -q             # 43 tests, all offline
+pytest -q             # 55 tests, all offline
 ```
 
 `demo.py` output:
@@ -42,8 +42,8 @@ The Wikimedia API returns 404 when an article had no traffic in the window, not
 just when the article does not exist. Treating that as a failure would abort a
 run because a small museum had a quiet week.
 
-The trap is believing it. The live API will answer 404 for one window and 200,
-for those same days, to a request that starts earlier:
+The trap is believing it. Whether the API answers 404 depends on the *shape* of
+the request, not only on whether the days have traffic:
 
 ```
 Hobbiton_Movie_Set, ending 2026-08-10:  1d 200  2d 200  3d 200  5d 404  7d 404  10d 200  14d 200
@@ -55,10 +55,18 @@ window calls empty. Believing it loses those days permanently, because the
 watermark advances past them and nothing asks again. The run still reports `ok`
 with a 0% reject rate, since the rows were never rejected — they never arrived.
 
-So `fetch_window` re-asks an empty window with an earlier start and trims the
-answer back to the range requested. Only when every widening also 404s is the
-window accepted as quiet. An article that genuinely does not exist 404s at every
-width, which is what stops this from inventing data.
+Widening the window catches many of these, and it is one cheap request, so it is
+tried first. It is not enough on its own. A live 30 day window,
+`Hobbiton_Movie_Set` over 2026-07-13..2026-08-11, answered 404 at its own width
+*and* at both widenings — while every 7 day slice of it answered 200. That run
+loaded 690 rows instead of 720 and called itself `ok`.
+
+So an empty answer is checked twice over: widen first, and if that still comes
+back empty, halve the window and ask about the pieces, recursing only into the
+pieces that also 404. The 30 day window above gives up all 30 days for 9
+requests. An article that genuinely does not exist answers 404 at every width
+and every slice, down to single days, which is what stops this from inventing
+data.
 
 **2. Retry 429 and 5xx. Never retry 400.**
 A malformed request will be malformed on the retry too, so retrying it only
@@ -112,20 +120,32 @@ the rest.
 | Table | What it holds |
 |---|---|
 | `pageviews` | Clean daily views, keyed `(venue_id, view_date)` |
-| `quarantine` | Rejected rows with the rule they broke and the raw payload |
+| `quarantine` | Rejected rows: the day, the rule they broke, and the raw payload |
 | `watermark` | Last date covered per venue, so the next run resumes there |
 | `run_log` | One row per run: counts, reject rate, status, failure note |
 
-A failed run still writes to `run_log`. A job that fails silently is worse than
-one that fails loudly.
+A failed run still writes to `run_log`, with the reject rate that failed it. A
+job that fails silently is worse than one that fails loudly.
+
+`quarantine.view_date` is nullable, and the null case is the honest one: a row
+rejected by `timestamp_parses` has no day to record, because the day is what was
+wrong with it. Every other rule fills it in.
 
 ```sql
 -- did anything go wrong lately, and how much
 SELECT started_at, status, rows_loaded, rows_quarantined, reject_rate, note
 FROM run_log ORDER BY started_at DESC LIMIT 10;
 
--- what got rejected and why
-SELECT rule, count(*) FROM quarantine GROUP BY 1 ORDER BY 2 DESC;
+-- what got rejected and why. Count days, not rows: a venue stuck on a bad day
+-- re-quarantines it every run, so count(*) measures how long it has been stuck
+-- rather than how much is actually wrong.
+SELECT rule,
+       count(DISTINCT (venue_id, view_date)) AS bad_days,
+       count(*)                              AS rows_seen
+FROM quarantine GROUP BY 1 ORDER BY 2 DESC;
+
+-- which venues are stuck, and how far behind
+SELECT venue_id, last_date FROM watermark ORDER BY last_date;
 ```
 
 ## Acceptance criteria
@@ -144,18 +164,23 @@ Applied per row, in this order:
 
 ## Testing
 
-43 tests, no network. The HTTP call is injected into `fetch_window` and the
+55 tests, no network. The HTTP call is injected into `fetch_window` and the
 fetcher is injected into `ingest.run`, so the suite drives real code paths with
 stubbed transport rather than mocking out the logic being tested.
 
 Covered: URL quoting for titles like `Sky_Tower_(Auckland)`, 404 verified before
-it is believed and accepted as empty only when every widening agrees, recovered
-rows trimmed to the requested window, unparseable timestamps left for quarantine
-rather than dropped in the trim, `Retry-After` honoured, backoff growth, give-up
+it is believed and accepted as empty only when every widening and every slice
+agrees, a window that answers only in slices stitched back together in order,
+subdivision recursing only into the pieces that failed, recovered rows trimmed
+to the requested window, unparseable timestamps left for quarantine rather than
+dropped in the trim, `Retry-After` honoured, backoff growth, give-up
 after max attempts, 400 not retried, both schema drift cases, every acceptance
 rule, window tiling with no gap or overlap, watermark resume, idempotent re-run,
-restatement overwrite, a gate failure leaving the warehouse untouched, and the
-watermark refusing to step over a quarantined day while a later run recovers it.
+restatement overwrite, a gate failure leaving the warehouse untouched and still
+logging the rate that failed it, the watermark refusing to step over a
+quarantined day while a later run recovers it, quarantined rows carrying the day
+they belong to (and a null day when that is the defect), and the lookback cap
+bounding a stuck venue while recording what it gave up on.
 
 CI runs lint, format check, and tests on Python 3.10 through 3.13.
 
@@ -165,15 +190,25 @@ CI runs lint, format check, and tests on Python 3.10 through 3.13.
 - Wikimedia publishes with a lag, so the job stops two days short of today.
 - Runs are sequential. Eight venues is small enough that concurrency would add
   more failure modes than it removes wall clock.
-- Verifying a 404 costs up to two extra requests for that window, so a run where
-  every venue is quiet is three times the request volume. At eight venues that is
-  noise. At several hundred it would need a cap, or a memo of which windows have
-  already been verified empty so a backfill does not re-verify them every night.
-- A venue whose bad day never becomes good stops advancing and re-fetches that
-  day every run. That is the deliberate trade against silently skipping it, and
-  it is visible rather than silent: the watermark stalls and `quarantine` grows.
-  A stuck venue is a query — `SELECT venue_id, last_date FROM watermark ORDER BY
-  last_date` — not a surprise six months later.
+- Verifying a 404 is not free, and the bill scales with how wrong the API is
+  being. A spurious 404 on a 30 day window costs about 9 requests to unpick. A
+  window that really is empty is the expensive case, because it 404s all the way
+  down: roughly 2n requests for an n day window, so a mis-typed article title
+  costs ~60 requests per window per run rather than 1. At eight venues that is
+  affordable and the alternative is losing days silently. At several hundred it
+  would need a memo of which windows have already been verified empty, so a
+  backfill does not re-derive the same nothing every night.
+- `run_log.requests` counts windows asked for, not HTTP calls. Verification can
+  turn one window into several calls, so the two diverge exactly when the API is
+  misbehaving.
+- A venue whose bad day never becomes good stops advancing, and then re-asks for
+  everything from that day to today — not just the bad day — so both the range and
+  the rewrite grow every run. `max_lookback_days` caps that at 180 days. Hitting
+  the cap is not free: the span below it is abandoned, which is the same silent
+  skip the watermark logic exists to prevent, so it is written to `run_log.note`
+  (`v0: gave up on 12 days`) rather than happening quietly. A stuck venue is a
+  query — `SELECT venue_id, last_date FROM watermark ORDER BY last_date` — not a
+  surprise six months later.
 - The watermark advances to the end of the requested range, including windows
   that came back empty. Otherwise a genuinely quiet venue would be re-requested
   forever. Decision 1 is what makes that safe: an empty window is verified

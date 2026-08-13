@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from datetime import date
+from datetime import date, datetime, timedelta
 
 import pytest
 
@@ -68,8 +68,17 @@ def test_404_everywhere_means_no_traffic_not_failure():
         "Waitomo_Glowworm_Caves", date(2026, 1, 1), date(2026, 1, 5), opener=opener
     )
     assert rows == []
-    expected_calls = 1 + len(client.VERIFY_PADS)
-    assert len(opener.urls) == expected_calls, "the 404 should be verified, not trusted"
+    assert len(opener.urls) > 1 + len(client.VERIFY_PADS), (
+        "empty should only be believed after widening and subdividing"
+    )
+
+
+def test_a_single_day_404_is_taken_at_face_value():
+    """There is nothing left to subdivide, so this is the one cheap case."""
+    opener = Opener((404, {}, b""))
+    rows = client.fetch_window("Milford_Sound", date(2026, 1, 1), date(2026, 1, 1), opener=opener)
+    assert rows == []
+    assert len(opener.urls) == 1 + len(client.VERIFY_PADS)
 
 
 def days(*stamps: str, article: str = "Hobbiton_Movie_Set") -> bytes:
@@ -139,6 +148,73 @@ def test_verification_keeps_unparseable_timestamps_for_quarantine():
         "Hobbiton_Movie_Set", date(2026, 1, 1), date(2026, 1, 1), opener=opener
     )
     assert [r["timestamp"] for r in rows] == ["not-a-date", "2026010100"]
+
+
+class WidthSensitiveApi:
+    """Stands in for the live API's oddest habit: refusing a span while happily
+    serving the same days in smaller pieces.
+
+    `Hobbiton_Movie_Set` really did answer 404 for 2026-07-13..2026-08-11 and for
+    both widened retries, while every 7 day slice of that range answered 200.
+    """
+
+    def __init__(self, max_span_days, *, exists=True):
+        self.max_span_days = max_span_days
+        self.exists = exists
+        self.urls = []
+
+    def __call__(self, url):
+        self.urls.append(url)
+        tail = url.rsplit("/daily/", 1)[1]
+        start = datetime.strptime(tail.split("/")[0], "%Y%m%d").date()
+        end = datetime.strptime(tail.split("/")[1], "%Y%m%d").date()
+
+        if not self.exists or (end - start).days + 1 > self.max_span_days:
+            return 404, {}, b'{"detail": "not found"}'
+
+        stamps = []
+        cursor = start
+        while cursor <= end:
+            stamps.append(f"{cursor:%Y%m%d}00")
+            cursor += timedelta(days=1)
+        return 200, {}, days(*stamps)
+
+
+def test_a_window_answered_only_in_slices_is_recovered_whole():
+    api = WidthSensitiveApi(max_span_days=7)
+    start, end = date(2026, 7, 13), date(2026, 8, 11)
+
+    rows = client.fetch_window("Hobbiton_Movie_Set", start, end, opener=api)
+
+    assert len(rows) == 30, "every day of the window should come back"
+    assert [r["timestamp"] for r in rows] == sorted(r["timestamp"] for r in rows), (
+        "the pieces must be stitched back together in order"
+    )
+    assert rows[0]["timestamp"] == "2026071300"
+    assert rows[-1]["timestamp"] == "2026081100"
+
+
+def test_subdivision_returns_nothing_for_an_article_that_does_not_exist():
+    """404 all the way down to single days is the one honest empty."""
+    api = WidthSensitiveApi(max_span_days=7, exists=False)
+
+    rows = client.fetch_window("No_Such_Article", date(2026, 1, 1), date(2026, 1, 8), opener=api)
+
+    assert rows == []
+    single_days = [u for u in api.urls if u.endswith(u.rsplit("/", 1)[1]) and _is_single_day(u)]
+    assert single_days, "it should have gone all the way down before giving up"
+
+
+def _is_single_day(url: str) -> bool:
+    tail = url.rsplit("/daily/", 1)[1].split("/")
+    return tail[0] == tail[1]
+
+
+def test_subdivision_only_recurses_into_the_pieces_that_failed():
+    """Cost control: a slice that answers is not taken apart any further."""
+    api = WidthSensitiveApi(max_span_days=7)
+    client.fetch_window("Hobbiton_Movie_Set", date(2026, 7, 13), date(2026, 8, 11), opener=api)
+    assert len(api.urls) < 20, f"should not walk the whole tree, used {len(api.urls)}"
 
 
 def test_a_successful_window_is_not_re_requested():

@@ -46,8 +46,8 @@ TRANSPORT_STATUS = 599  # our own marker for "the socket died", not an HTTP code
 # 404. Observed against the live API: a window can 404 while a wider window
 # ending on the same day returns those exact days. No single pad is reliable
 # (a 7 day and a 45 day widening each failed on a case the others caught), so
-# two are tried. A genuinely absent article 404s at every pad, which is what
-# keeps this from inventing data.
+# two are tried. This is only the cheap first attempt - `_subdivide` is what
+# actually makes the verification trustworthy.
 VERIFY_PADS = (15, 30)
 
 
@@ -162,6 +162,51 @@ def _within(item: dict, start: date, end: date) -> bool:
     return f"{start:%Y%m%d}" <= stamp[:8] <= f"{end:%Y%m%d}"
 
 
+def _subdivide(
+    article: str,
+    start: date,
+    end: date,
+    *,
+    opener,
+    max_attempts: int,
+    sleep,
+) -> list[dict]:
+    """Halve a 404 window and ask about each piece. Recurses only into the pieces
+    that also 404, so a spurious 404 costs a handful of requests and only a window
+    that is empty all the way down pays for the whole tree.
+
+    This is what makes an empty answer trustworthy. Widening alone is not enough:
+    a live 30 day window for `Hobbiton_Movie_Set` answered 404 at its own width
+    and at both pads, while every 7 day slice of it answered 200. An article that
+    genuinely does not exist answers 404 at every slice, down to single days,
+    which is what stops this from inventing data.
+    """
+    span = (end - start).days + 1
+    if span <= 1:
+        return []
+
+    mid = start + timedelta(days=span // 2 - 1)
+    found: list[dict] = []
+    for piece_start, piece_end in ((start, mid), (mid + timedelta(days=1), end)):
+        items = _fetch_once(
+            article, piece_start, piece_end, opener=opener, max_attempts=max_attempts, sleep=sleep
+        )
+        if items is None:
+            found.extend(
+                _subdivide(
+                    article,
+                    piece_start,
+                    piece_end,
+                    opener=opener,
+                    max_attempts=max_attempts,
+                    sleep=sleep,
+                )
+            )
+        else:
+            found.extend(items)
+    return found
+
+
 def fetch_window(
     article: str,
     start: date,
@@ -175,12 +220,15 @@ def fetch_window(
     """Fetch one date window for one article. Returns [] when there was no traffic.
 
     A 404 is not taken at face value. The live API will answer 404 for a window
-    while answering 200, for those same days, to a request that starts earlier.
+    while answering 200, for those same days, to a request shaped differently.
     Believing the 404 loses the days permanently, because the caller advances its
-    watermark past them and never asks again. So an empty answer is re-asked with
-    a wider start; anything the wider window returns is trimmed back to the range
-    that was actually requested. Only when every widening also 404s do we accept
-    that there was no traffic.
+    watermark past them and never asks again.
+
+    So an empty answer is checked twice over. First cheaply, by asking again with
+    an earlier start and trimming the answer back to the range requested. Then, if
+    that still comes back empty, by halving the window and asking about the pieces
+    until either they give up their rows or they are single days. Only a window
+    that is empty at every width and every slice is accepted as quiet.
     """
     items = _fetch_once(article, start, end, opener=opener, max_attempts=max_attempts, sleep=sleep)
     if items is not None:
@@ -198,4 +246,4 @@ def fetch_window(
         if widened is not None:
             return [item for item in widened if _within(item, start, end)]
 
-    return []
+    return _subdivide(article, start, end, opener=opener, max_attempts=max_attempts, sleep=sleep)
