@@ -6,7 +6,7 @@ from datetime import date, timedelta
 
 import pytest
 
-from src import ingest, quality
+from src import client, ingest, quality
 
 TODAY = date(2026, 3, 1)
 VENUES = [
@@ -483,6 +483,61 @@ def test_warehouse_from_an_older_version_is_migrated(con, tmp_path):
         assert migrated.execute("SELECT view_date FROM quarantine").fetchone()[0] == end
     finally:
         migrated.close()
+
+
+def test_a_failed_run_keeps_the_note_about_days_it_abandoned(con):
+    """The run that both gave up on days and then failed is the one whose note is
+    worth most. Replacing it with the exception lost the half that is not in the
+    traceback."""
+    end = TODAY - timedelta(days=ingest.PUBLICATION_LAG_DAYS)
+    con.execute(
+        "INSERT OR REPLACE INTO watermark VALUES (?, ?, current_timestamp)",
+        ["milford-sound", end - timedelta(days=400)],
+    )
+
+    def poisoned(article, start, end):
+        rows, cursor = [], start
+        while cursor <= end:
+            rows.append(
+                {
+                    "project": "en.wikipedia",
+                    "article": article,
+                    "granularity": "daily",
+                    "timestamp": f"{cursor:%Y%m%d}00",
+                    "access": "all-access",
+                    "agent": "user",
+                    "views": -1,
+                }
+            )
+            cursor += timedelta(days=1)
+        return rows
+
+    with pytest.raises(quality.QualityGateFailed):
+        ingest.run(con, VENUES, today=TODAY, chunk_days=400, max_lookback_days=180, fetch=poisoned)
+
+    note = con.execute("SELECT note FROM run_log").fetchone()[0]
+    assert "gave up on" in note, "the abandoned days must survive the failure"
+    assert "QualityGateFailed" in note, "and so must the reason it failed"
+
+
+def test_a_failure_partway_through_still_reports_what_was_abandoned(con):
+    """The note is composed from `stalled` at the point of failure, so it works
+    even when nothing reached the gate."""
+    end = TODAY - timedelta(days=ingest.PUBLICATION_LAG_DAYS)
+    con.execute(
+        "INSERT OR REPLACE INTO watermark VALUES (?, ?, current_timestamp)",
+        ["milford-sound", end - timedelta(days=400)],
+    )
+
+    def exploding(article, start, end):
+        raise client.ApiError("HTTP 403")
+
+    with pytest.raises(client.ApiError):
+        ingest.run(con, VENUES, today=TODAY, chunk_days=400, max_lookback_days=180, fetch=exploding)
+
+    note = con.execute("SELECT note FROM run_log").fetchone()[0]
+    assert "gave up on" in note
+    assert "ApiError" in note
 
 
 def test_run_log_records_every_run(con):

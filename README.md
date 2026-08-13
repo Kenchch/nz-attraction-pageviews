@@ -22,7 +22,7 @@ pip install -r requirements.txt
 
 python demo.py        # offline, synthetic API, no network needed
 python -m src         # live, hits the Wikimedia API
-pytest -q             # 58 tests, all offline
+pytest -q             # 65 tests, all offline
 ```
 
 `demo.py` output:
@@ -76,6 +76,13 @@ burns someone else's rate limit. Backoff honours `Retry-After` when the server
 sends one, otherwise `2^attempt` plus jitter. The jitter matters because eight
 venues are fetched in a loop: without it, every retry lands on the same second
 and recreates the burst that caused the throttle.
+
+`Retry-After` is treated as a request, not an instruction, and capped at two
+minutes. It is a number chosen by someone else's infrastructure: a misconfigured
+proxy answering `86400` would park a nightly job for a day, and `float` accepts
+`inf` and `nan` as readily as `30`. Capped, the whole retry sequence is bounded
+at a few minutes, after which the window fails loudly and the watermark stays
+put — so the days are asked for again tomorrow rather than lost.
 
 **3. A missing field is schema drift, and it stops the run.**
 `EXPECTED_FIELDS` is the contract. If the API drops a field, the run fails with
@@ -134,8 +141,11 @@ the rest.
 | `watermark` | Last date covered per venue, so the next run resumes there |
 | `run_log` | One row per run: counts, reject rate, status, failure note |
 
-A failed run still writes to `run_log`, with the reject rate that failed it. A
-job that fails silently is worse than one that fails loudly.
+A failed run still writes to `run_log`, with the reject rate that failed it and
+whatever else it had to say — a run that abandoned days *and then* failed keeps
+both facts in `note`, since the half that is not in the traceback is the half
+you would never otherwise learn. A job that fails silently is worse than one that
+fails loudly.
 
 `quarantine.view_date` is nullable, and the null case is the honest one: a row
 rejected by `timestamp_parses` has no day to record, because the day is what was
@@ -174,7 +184,7 @@ Applied per row, in this order:
 
 ## Testing
 
-58 tests, no network. The HTTP call is injected into `fetch_window` and the
+65 tests, no network. The HTTP call is injected into `fetch_window` and the
 fetcher is injected into `ingest.run`, so the suite drives real code paths with
 stubbed transport rather than mocking out the logic being tested.
 
@@ -190,8 +200,10 @@ restatement overwrite, a gate failure leaving the warehouse untouched and still
 logging the rate that failed it, the watermark refusing to step over a
 quarantined day, over a day missing from the tail of a 200, or over a hole in the
 middle of one — while a later run recovers all three — quarantined rows carrying
-the day they belong to (and a null day when that is the defect), and the lookback
-cap bounding a stuck venue while recording what it gave up on.
+the day they belong to (and a null day when that is the defect), the lookback cap
+bounding a stuck venue while recording what it gave up on even when the run then
+fails, and `Retry-After` capped rather than obeyed when a server asks for a day
+or sends something that is not a finite number.
 
 CI runs lint, format check, and tests on Python 3.10 through 3.13.
 

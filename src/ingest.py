@@ -268,8 +268,7 @@ def run(
         # Record the rate before the gate can raise, so a failed run logs the
         # number that explains why it failed rather than 0.0.
         summary.reject_rate = quality.reject_rate(summary.rows_fetched, summary.rows_quarantined)
-        if stalled:
-            summary.note = "; ".join(stalled)
+        summary.note = "; ".join(stalled)
         quality.enforce_gate(summary.rows_fetched, summary.rows_quarantined, max_reject_rate)
 
         _load(con, run_id, clean, bad, new_watermarks)
@@ -278,7 +277,12 @@ def run(
 
     except Exception as exc:
         summary.status = "failed"
-        summary.note = f"{type(exc).__name__}: {exc}"
+        # Append rather than replace. A run that abandoned days and *then* failed
+        # is the run whose note is worth most, and overwriting it lost the half
+        # that does not turn up in the traceback. `stalled` is read here rather
+        # than from summary.note because the failure may have come mid-loop,
+        # before the note was composed at all.
+        summary.note = "; ".join([*stalled, f"{type(exc).__name__}: {exc}"])
         _write_run_log(con, summary, started_at)
         raise
 
