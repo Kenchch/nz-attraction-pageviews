@@ -22,7 +22,7 @@ pip install -r requirements.txt
 
 python demo.py                     # offline, synthetic API, no network needed
 python -m nz_attraction_pageviews  # live, hits the Wikimedia API
-pytest -q                          # 82 tests, all offline
+pytest -q                          # 85 tests, all offline
 ```
 
 `demo.py` output:
@@ -89,6 +89,12 @@ on it would leave the omitted days for the watermark to notice rather than fixin
 them here. That costs two extra requests when the halves answer — the whole
 subdivision only recurses into pieces that 404.
 
+The merge is between the two sources only. A single response that names the same
+day twice keeps both rows, for `one_row_per_date` to judge in the next stage.
+Collapsing them here would be the verification layer quietly deciding a quality
+question, and the drift would never be recorded — which is the failure this
+module exists to prevent, arriving by the back door.
+
 **2. Retry 429 and 5xx. Never retry 400.**
 A malformed request will be malformed on the retry too, so retrying it only
 burns someone else's rate limit. Backoff honours `Retry-After` when the server
@@ -146,7 +152,11 @@ published, and its absence can only mean quiet. Past that, only age: an absent
 day older than `TRUST_LAG_DAYS` is taken as quiet, a more recent one is left
 alone and asked for again next run. So the watermark advances to the last day
 actually loaded, holes behind it included, or to the trust line, whichever is
-further — and never past a quarantined day, whatever its age. The cost is that
+further — and never past a quarantined day *inside the range it asked for*,
+whatever its age. A rejected row dated outside that range is still recorded in
+`quarantine`, but it does not hold the watermark: the watermark only promises
+about days this run requested, and it passed that one long ago. Stopping for it
+would neither recover the day nor stop happening. The cost of all this is that
 every venue re-asks for its last few days each night.
 
 **5. The gate runs before the load, not after.**
@@ -217,7 +227,7 @@ Applied per row, in this order:
 
 ## Testing
 
-82 tests, no network. The HTTP call is injected into `fetch_window` and the
+85 tests, no network. The HTTP call is injected into `fetch_window` and the
 fetcher is injected into `ingest.run`, so the suite drives real code paths with
 stubbed transport rather than mocking out the logic being tested.
 

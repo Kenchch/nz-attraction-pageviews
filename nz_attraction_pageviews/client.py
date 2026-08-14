@@ -255,14 +255,8 @@ def fetch_window(
     if items is not None:
         return items
 
-    recovered: dict[str, dict] = {}
-
-    def keep(candidates):
-        for item in candidates:
-            if _within(item, start, end):
-                recovered.setdefault(str(item.get("timestamp")), item)
-
     # Widening is a cheap way to get rows, never evidence that there are none.
+    widened_rows: list[dict] = []
     for pad in verify_pads:
         widened = _fetch_once(
             article,
@@ -273,15 +267,27 @@ def fetch_window(
             sleep=sleep,
         )
         if widened is not None:
-            keep(widened)
+            widened_rows = [item for item in widened if _within(item, start, end)]
             break
 
-    # Subdivide regardless of what the widening produced. A widened 200 can
+    # Subdivide regardless of what the widening produced: a widened 200 can
     # mention some of the requested days and quietly omit the rest, which is the
-    # same failure as the 404 wearing a success code, and returning early on the
-    # partial answer would leave the omitted days to be noticed by the watermark
-    # rather than fixed here. Subdivision only recurses into pieces that 404, so
-    # when the data is there this costs two requests.
-    keep(_subdivide(article, start, end, opener=opener, max_attempts=max_attempts, sleep=sleep))
+    # same failure as the 404 wearing a success code. Subdivision only recurses
+    # into pieces that 404, so when the data is there this costs two requests.
+    #
+    # De-duplication is across the two sources only, never within one response.
+    # A single response that repeats a day is drift, and collapsing it here would
+    # mean `one_row_per_date` never sees it - the same silent drop this module
+    # exists to avoid.
+    covered = {str(item.get("timestamp")) for item in widened_rows}
+    extra = [
+        item
+        for item in _subdivide(
+            article, start, end, opener=opener, max_attempts=max_attempts, sleep=sleep
+        )
+        if _within(item, start, end) and str(item.get("timestamp")) not in covered
+    ]
 
-    return sorted(recovered.values(), key=lambda item: str(item.get("timestamp")))
+    # A stable sort keeps a repeated day in the order it arrived, widened first,
+    # so `one_row_per_date` quarantines the second exactly as on the direct path.
+    return sorted(widened_rows + extra, key=lambda item: str(item.get("timestamp")))

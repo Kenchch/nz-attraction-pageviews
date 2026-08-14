@@ -304,6 +304,53 @@ def test_a_partial_widened_200_is_completed_by_subdividing():
     assert [r["timestamp"] for r in rows] == [f"2026010{n}00" for n in range(1, 9)]
 
 
+def test_recovery_keeps_a_repeated_day_for_the_quarantine():
+    """Same payload, same outcome, whichever path it arrived by. Collapsing the
+    repeat here would mean `one_row_per_date` never sees the drift."""
+    opener = Opener((404, {}, b""), (200, {}, days("2026010100", "2026010100")))
+    rows = client.fetch_window(
+        "Hobbiton_Movie_Set", date(2026, 1, 1), date(2026, 1, 1), opener=opener
+    )
+    assert [r["timestamp"] for r in rows] == ["2026010100", "2026010100"]
+
+
+class WidenAndSliceApi:
+    """Refuses the exact window, answers everything else - so the widening and
+    the subdivision both supply the same days."""
+
+    def __init__(self, start, end):
+        self.start, self.end = start, end
+        self.urls = []
+
+    def __call__(self, url):
+        self.urls.append(url)
+        tail = url.rsplit("/daily/", 1)[1].split("/")
+        start = datetime.strptime(tail[0], "%Y%m%d").date()
+        end = datetime.strptime(tail[1], "%Y%m%d").date()
+        if (start, end) == (self.start, self.end):
+            return 404, {}, b'{"detail": "not found"}'
+
+        stamps, cursor = [], start
+        while cursor <= end:
+            stamps.append(f"{cursor:%Y%m%d}00")
+            cursor += timedelta(days=1)
+        return 200, {}, days(*stamps)
+
+
+def test_a_day_supplied_by_both_sources_is_returned_once():
+    """Merging must not turn one day into two just because two requests saw it."""
+    start, end = date(2026, 1, 1), date(2026, 1, 4)
+    rows = client.fetch_window(
+        "Hobbiton_Movie_Set", start, end, opener=WidenAndSliceApi(start, end)
+    )
+    assert [r["timestamp"] for r in rows] == [
+        "2026010100",
+        "2026010200",
+        "2026010300",
+        "2026010400",
+    ]
+
+
 def test_subdivision_trims_days_nobody_asked_about():
     """A slice can answer with days outside its own range. The two verification
     paths should not disagree about what this function may return."""
