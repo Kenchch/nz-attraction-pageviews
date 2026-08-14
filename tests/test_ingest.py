@@ -226,6 +226,46 @@ def test_watermark_does_not_step_over_quarantined_days(con):
     assert ingest.get_watermark(con, "te-papa") == end, "a clean venue is unaffected"
 
 
+class StraysBeforeTheWindow(Recorder):
+    """Every requested day, plus one row for a day a year before the window."""
+
+    def __call__(self, article, start, end):
+        rows = super().__call__(article, start, end)
+        stray = start - timedelta(days=365)
+        rows.append(
+            {
+                "project": "en.wikipedia",
+                "article": article,
+                "granularity": "daily",
+                "timestamp": f"{stray:%Y%m%d}00",
+                "access": "all-access",
+                "agent": "user",
+                "views": 100,
+            }
+        )
+        return rows
+
+
+def test_a_stray_day_before_the_window_does_not_freeze_the_watermark(con):
+    """The stray row is quarantined, but it is not a day this run promised
+    anything about - the watermark passed it runs ago. Holding the watermark for
+    it would re-fetch the whole range every night and never recover anything."""
+    end = TODAY - timedelta(days=ingest.PUBLICATION_LAG_DAYS)
+
+    summary = ingest.run(
+        con,
+        VENUES,
+        today=TODAY,
+        backfill_days=10,
+        chunk_days=30,
+        max_reject_rate=1.0,
+        fetch=StraysBeforeTheWindow(),
+    )
+
+    assert summary.rows_quarantined == 2, "the stray day is still recorded, not ignored"
+    assert ingest.get_watermark(con, "milford-sound") == end
+
+
 def test_watermark_stops_at_the_first_bad_day_not_the_last(con):
     end = TODAY - timedelta(days=ingest.PUBLICATION_LAG_DAYS)
     first_day = end - timedelta(days=9)
