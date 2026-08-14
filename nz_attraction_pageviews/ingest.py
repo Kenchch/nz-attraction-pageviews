@@ -248,9 +248,13 @@ def _venue_watermark(
         # the one thing we must not do.
         return None
 
-    ceiling = end
-    if venue_bad:
-        ceiling = min(row.view_date for row in venue_bad) - timedelta(days=1)
+    # Only a bad day *inside* the window is a day this run promised anything
+    # about. A stray date outside it is still recorded in `quarantine`, but the
+    # watermark passed that day runs ago; stopping for it permanently neither
+    # recovers the day nor stops recurring, and would leave the venue re-fetching
+    # its whole range every night until it hit the lookback cap.
+    in_window = [row.view_date for row in venue_bad if start <= row.view_date <= end]
+    ceiling = min(in_window) - timedelta(days=1) if in_window else end
 
     trusted = min(end, trusted_end)
     loaded = [row.view_date for row in venue_clean]
