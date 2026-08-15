@@ -273,9 +273,13 @@ def fetch_window(
             max_attempts=max_attempts,
             sleep=sleep,
         )
-        if widened is not None:
+        if widened:
             widened_rows = [item for item in widened if _within(item, start, end)]
             break
+        # An empty pad is not an answer either, so try the next one. The pads
+        # differ in what they catch - a 7 day and a 45 day widening each failed
+        # on a case the other caught - and breaking here spent the first pad's
+        # silence as though it were the second pad's evidence.
 
     # Subdivide regardless of what the widening produced: a widened 200 can
     # mention some of the requested days and quietly omit the rest, which is the

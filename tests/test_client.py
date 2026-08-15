@@ -571,3 +571,18 @@ def test_backoff_is_the_documented_powers_of_two():
 def test_backoff_jitter_actually_varies():
     """Without jitter every venue's retry lands on the same second."""
     assert len({client._backoff_seconds(2, {}) for _ in range(20)}) > 1
+
+
+def test_an_empty_pad_is_not_evidence_either():
+    """The pads differ in what they catch, so spending the first pad's silence as
+    though it were the second pad's answer loses whatever only the second finds."""
+    opener = Opener(
+        (404, {}, b""),
+        (200, {}, b'{"items": []}'),
+        (200, {}, days("2026010100")),
+    )
+    rows = client.fetch_window(
+        "Hobbiton_Movie_Set", date(2026, 1, 1), date(2026, 1, 1), opener=opener
+    )
+    assert [r["timestamp"] for r in rows] == ["2026010100"], "the second pad had it"
+    assert len(opener.urls) == 3

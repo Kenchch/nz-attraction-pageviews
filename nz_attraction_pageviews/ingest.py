@@ -162,20 +162,26 @@ def read_venues(path: str | Path) -> list[Venue]:
             raise ValueError(f"{path}: missing column(s) {missing}; found {header}")
         # csv.DictReader keeps the *last* value for a repeated column name, so a
         # duplicated header silently discards the real value - or, for a repeated
-        # `venue_id`, files every row under the wrong venue.
-        repeated = sorted({column for column in header if header.count(column) > 1})
+        # `venue_id`, files every row under the wrong venue. Only the columns we
+        # actually read matter: a spreadsheet export ends lines with stray commas,
+        # which DictReader names `''` twice over, and two notes columns of
+        # someone else's are still none of our business.
+        repeated = sorted({column for column in VENUE_COLUMNS if header.count(column) > 1})
         if repeated:
             raise ValueError(f"{path}: repeated column(s) {repeated} in header {header}")
 
         venues: list[Venue] = []
         seen: dict[str, int] = {}
         for line, row in enumerate(reader, start=2):
-            # NFC everywhere, so a macron typed as `u` + combining macron matches
-            # the API's single codepoint. See `quality.normalise_title`.
-            fields = {
-                column: quality.normalise_title((row.get(column) or "").strip())
-                for column in VENUE_COLUMNS
-            }
+            fields = {column: (row.get(column) or "").strip() for column in VENUE_COLUMNS}
+            # NFC on the title only, so a macron typed as `u` + combining macron
+            # matches the API's single codepoint (see `quality.normalise_title`).
+            # Deliberately not on `venue_id`: it is the key every stored row is
+            # written under, so re-spelling it would orphan an existing
+            # warehouse's watermark and duplicate its history under a second id
+            # that looks identical on screen. It buys nothing there either - the
+            # id is ours, and never compared with anything the API sends.
+            fields["wiki_article"] = quality.normalise_title(fields["wiki_article"])
             blank = [column for column, value in fields.items() if not value]
             if blank:
                 raise ValueError(f"{path} line {line}: empty {blank}")
@@ -353,7 +359,7 @@ def run(
         # nothing - the calendar line stands, so a set of venues that are all
         # genuinely quiet still makes progress. That is the failure in the other
         # direction, and it is the one the trust lag was introduced to avoid.
-        observed = _publication_frontier(con, clean)
+        observed = _publication_frontier(con, clean, end)
         trusted_end = calendar_trust_line
         if observed is not None:
             trusted_end = min(trusted_end, observed)
@@ -367,13 +373,25 @@ def run(
             if frontier is not None and (current is None or frontier > current):
                 new_watermarks[venue.venue_id] = frontier
 
-            # A venue that has never produced a single row is the shape a typo in
-            # `venues.csv` makes: the API 404s at every width and slice, the
-            # window verifies as genuinely empty, and the run reports `ok` having
-            # quietly retired the whole backfill. Nothing else in the summary
-            # distinguishes that from a venue nobody reads.
+            # Two shapes worth naming, both of which look like `ok` otherwise.
+            #
+            # A venue that asked for its whole range and has never produced a row
+            # is what a typo in `venues.csv` makes: the article does not exist,
+            # every width and slice 404s, the window verifies as genuinely empty,
+            # and the run retires the backfill. A venue that is simply quiet has
+            # the same shape, and deserves the same second look.
+            #
+            # A venue whose watermark is falling further behind `end` every night
+            # is stuck - on a day it cannot load, or on a frontier that is not
+            # moving. Holding is the intended behaviour, since it re-requests
+            # rather than losing the days, but it should not be something you have
+            # to notice for yourself. A healthy venue sits within a day or two of
+            # `end`, so the trust lag is a generous threshold.
+            effective = new_watermarks.get(venue.venue_id, current)
             if not venue_clean and not venue_bad and not _has_any_rows(con, venue.venue_id):
                 silent.append(f"{venue.venue_id}: no rows ever, check {venue.wiki_article!r}")
+            elif effective is not None and (end - effective).days > trust_lag_days:
+                silent.append(f"{venue.venue_id}: {(end - effective).days} days behind")
 
         summary.rows_quarantined = len(bad)
         # Record the rate before the gate can raise, so a failed run logs the
@@ -404,7 +422,7 @@ def run(
     return summary
 
 
-def _publication_frontier(con, clean: list[quality.CleanRow]) -> date | None:
+def _publication_frontier(con, clean: list[quality.CleanRow], end: date) -> date | None:
     """The newest day any venue has ever produced a row for, or None if none has.
 
     Read from the warehouse as well as from this run, because during a stall this
@@ -413,8 +431,15 @@ def _publication_frontier(con, clean: list[quality.CleanRow]) -> date | None:
     answer. Judging on this run alone would fall back to the calendar line in
     exactly the case the frontier exists to cover.
     """
-    stored = con.execute("SELECT max(view_date) FROM pageviews").fetchone()[0]
-    seen = [row.view_date for row in clean]
+    stored = con.execute(
+        # Bounded by `end`: a row dated in the future - drift that predates the
+        # acceptance rules, or a hand-inserted one - would otherwise be the newest
+        # day in the table for ever, pinning the frontier above the calendar line
+        # and quietly turning this whole mechanism back off.
+        "SELECT max(view_date) FROM pageviews WHERE view_date <= ?",
+        [end],
+    ).fetchone()[0]
+    seen = [row.view_date for row in clean if row.view_date <= end]
     if stored is not None:
         seen.append(stored)
     return max(seen) if seen else None

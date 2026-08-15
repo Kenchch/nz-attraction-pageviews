@@ -22,7 +22,7 @@ pip install -r requirements.txt
 
 python demo.py                     # offline, synthetic API, no network needed
 python -m nz_attraction_pageviews  # live, hits the Wikimedia API
-pytest -q                          # 114 tests, all offline
+pytest -q                          # 119 tests, all offline
 ```
 
 `demo.py` output:
@@ -165,9 +165,13 @@ overtook the frontier for good and the venue never loaded another row. So the
 trust line is also bounded by the newest day *any* venue has produced a row for,
 this run or in any run before it — publication is a property of the API, not of
 one article. During a stall that frontier stops, the trust line stops with it,
-and the days cost a re-request instead of vanishing. With no evidence anywhere,
-an empty warehouse and a run that fetched nothing, the calendar line stands, so
-venues that are all genuinely quiet still make progress.
+and the days cost a re-request instead of vanishing. With no evidence at all — an empty
+warehouse and a run that fetched nothing — the calendar line stands, so a first
+run against quiet venues still makes progress. Once the warehouse holds a single
+row that escape hatch closes, which is the point: from then on the frontier is
+the honest answer to "has anything been published this recently?". A venue that
+stops advancing is named in `run_log.note` as *N days behind*, so holding is
+visible rather than something you have to notice.
 
 So the watermark advances to the last day actually loaded, holes behind it
 included, or to the trust line, whichever is
@@ -247,7 +251,7 @@ Applied per row, in this order:
 
 ## Testing
 
-114 tests, no network. The HTTP call is injected into `fetch_window` and the
+119 tests, no network. The HTTP call is injected into `fetch_window` and the
 fetcher is injected into `ingest.run`, so the suite drives real code paths with
 stubbed transport rather than mocking out the logic being tested.
 
@@ -298,7 +302,11 @@ CI runs lint, format check, and tests on Python 3.10 through 3.13.
 - Verification is not free in the ordinary case either, not just the pathological
   one. A venue whose recent days are genuinely absent re-asks for them every
   night, and each of those windows now 404s or answers empty and is verified in
-  full — roughly 13 requests where a venue with traffic costs 1. At eight venues
+  full — roughly 13 requests where a venue with traffic costs 1. An upstream that
+  reports "no data" as `200 {"items": []}` rather than 404 is now verified the
+  same way, so a first run against one costs about 1,400 requests for eight
+  venues rather than 24. That is the price of not believing it; a request budget
+  that stops a run rather than a window is the thing this does not have. At eight venues
   that is affordable; at several hundred it would need a memo of which windows
   have already been verified empty.
 - A typo in `venues.csv` looks exactly like a quiet venue: the article does not
