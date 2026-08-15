@@ -391,18 +391,72 @@ def test_a_hole_behind_a_day_that_arrived_is_trusted_as_quiet(con):
     )
 
 
+class QuietFor:
+    """Full data for every article except the named one, which returns nothing.
+
+    Separates the two things that can settle an absent day: evidence that
+    publication reached it (another venue's rows, since publication is a property
+    of the upstream and not of one article) and the day's own age.
+    """
+
+    def __init__(self, quiet_article):
+        self.quiet_article = quiet_article
+
+    def __call__(self, article, start, end):
+        if article == self.quiet_article:
+            return []
+        return Recorder()(article, start, end)
+
+
 def test_an_absent_day_is_trusted_once_it_is_old_enough(con):
-    """Nothing arrives after it to settle it, so only age can."""
+    """Nothing of this venue's own arrives to settle its absent days, so only age
+    can - and the rest of the run proves publication is keeping up."""
     end = TODAY - timedelta(days=ingest.PUBLICATION_LAG_DAYS)
-    published_to = TODAY - timedelta(days=10)
-
-    ingest.run(con, VENUES, today=TODAY, backfill_days=20, chunk_days=30, fetch=Laggy(published_to))
-
     trust_line = TODAY - timedelta(days=ingest.TRUST_LAG_DAYS)
+
+    ingest.run(
+        con, VENUES, today=TODAY, backfill_days=20, chunk_days=30, fetch=QuietFor("Milford_Sound")
+    )
+
     assert ingest.get_watermark(con, "milford-sound") == trust_line, (
         "absent days older than the trust lag are quiet; newer ones stay unsettled"
     )
     assert trust_line < end
+
+
+def test_the_trust_lag_cannot_step_over_days_nothing_published(con):
+    """The calendar trust line alone was a bet that the lag never runs longer than
+    TRUST_LAG_DAYS. A longer stall walked the watermark over days no venue had
+    ever seen a row for, and the run still said `ok`. The line is now also bounded
+    by the newest day the run actually observed, anywhere."""
+    published_to = TODAY - timedelta(days=12)  # a stall well past the trust lag
+    trust_line = TODAY - timedelta(days=ingest.TRUST_LAG_DAYS)
+
+    summary = ingest.run(
+        con, VENUES, today=TODAY, backfill_days=30, chunk_days=30, fetch=Laggy(published_to)
+    )
+
+    assert summary.status == "ok"
+    assert published_to < trust_line, "the stall has to outrun the trust lag for this to bite"
+    assert ingest.get_watermark(con, "milford-sound") == published_to, (
+        "nothing published past here, so nothing may be settled past here"
+    )
+
+
+def test_a_long_stall_costs_a_re_request_not_the_days(con):
+    """The point of holding: when the API catches up, the days are still asked for."""
+    end = TODAY - timedelta(days=ingest.PUBLICATION_LAG_DAYS)
+    published_to = TODAY - timedelta(days=12)
+
+    ingest.run(con, VENUES, today=TODAY, backfill_days=30, chunk_days=30, fetch=Laggy(published_to))
+    ingest.run(con, VENUES, today=TODAY, backfill_days=30, chunk_days=30, fetch=Recorder())
+
+    recovered = con.execute(
+        "SELECT count(*) FROM pageviews WHERE venue_id = 'milford-sound' AND view_date > ?",
+        [published_to],
+    ).fetchone()[0]
+    assert recovered == (end - published_to).days, "every stalled day arrives once it publishes"
+    assert ingest.get_watermark(con, "milford-sound") == end
 
 
 def test_a_quiet_venue_is_not_dragged_backwards(con):
@@ -422,13 +476,18 @@ def test_a_quiet_venue_is_not_dragged_backwards(con):
 def test_a_sparse_venue_still_makes_progress(con):
     """Measured against the live API, `Te_Rerenga_Wairua` has 74 absent days in 90.
     Treating every absent day as unsettled would strand a venue like that."""
-    end = TODAY - timedelta(days=ingest.PUBLICATION_LAG_DAYS)
-    busy = {end - timedelta(days=n) for n in range(0, 90, 3)}
+    anchor = TODAY - timedelta(days=ingest.PUBLICATION_LAG_DAYS)
+
+    def busy(day):
+        # A rule rather than a frozen set: a set anchored on the first run's end
+        # would also stop producing rows after it, which is a publication stall,
+        # not a sparse venue - and the watermark is right to hold for that.
+        return (anchor - day).days % 3 == 0
 
     def sparse(article, start, end):
         rows, cursor = [], start
         while cursor <= end:
-            if cursor in busy:
+            if busy(cursor):
                 rows.append(
                     {
                         "project": "en.wikipedia",
@@ -719,3 +778,172 @@ def test_read_venues_parses_the_shipped_csv():
     venues = ingest.read_venues("venues.csv")
     assert len(venues) == 8
     assert any(v.wiki_article == "Sky_Tower_(Auckland)" for v in venues)
+
+
+def test_a_venue_that_has_never_returned_a_row_is_named_in_the_note(con):
+    """The shape a typo in venues.csv makes: the article does not exist, every
+    width and slice 404s, the window verifies as genuinely empty and the run
+    reports `ok` having quietly retired the whole backfill. Nothing else in the
+    summary tells that apart from a venue nobody reads."""
+
+    def nothing_for_milford(article, start, end):
+        if article == "Milford_Sound":
+            return []
+        return Recorder()(article, start, end)
+
+    summary = ingest.run(
+        con, VENUES, today=TODAY, backfill_days=10, chunk_days=30, fetch=nothing_for_milford
+    )
+
+    assert summary.status == "ok"
+    assert "milford-sound" in summary.note
+    assert "Milford_Sound" in summary.note, "name the article, since that is what is wrong"
+    assert "te-papa" not in summary.note
+
+
+def test_a_venue_with_history_that_goes_quiet_is_not_flagged(con):
+    """Only 'never produced a row' is a config smell; a quiet week is not."""
+    ingest.run(con, VENUES, today=TODAY, backfill_days=10, chunk_days=30, fetch=Recorder())
+
+    def nothing(article, start, end):
+        return []
+
+    later = TODAY + timedelta(days=3)
+    summary = ingest.run(con, VENUES, today=later, backfill_days=10, chunk_days=30, fetch=nothing)
+    assert summary.note == ""
+
+
+def test_an_oversized_views_value_is_quarantined_without_taking_the_run_down(con):
+    """It used to pass every rule, then fail inside the driver - aborting the load
+    for every venue, every night, because no watermark advanced."""
+
+    def one_absurd_day(article, start, end):
+        rows = Recorder()(article, start, end)
+        if article == "Milford_Sound":
+            rows[0] = {**rows[0], "views": 2**64}
+        return rows
+
+    summary = ingest.run(
+        con,
+        VENUES,
+        today=TODAY,
+        backfill_days=5,
+        chunk_days=30,
+        max_reject_rate=1.0,
+        fetch=one_absurd_day,
+    )
+
+    assert summary.status == "ok"
+    assert summary.rows_quarantined == 1
+    assert con.execute("SELECT rule FROM quarantine").fetchone()[0] == "views_within_bigint"
+    assert (
+        con.execute("SELECT count(*) FROM pageviews WHERE venue_id = 'te-papa'").fetchone()[0] == 5
+    ), "the healthy venue is unaffected"
+
+
+def test_the_run_log_lands_in_the_same_transaction_as_the_data(con, monkeypatch):
+    """Written afterwards it could be lost while the data survived, leaving rows
+    no run claims to have loaded."""
+    original = ingest._write_run_log
+
+    def explode(*args, **kwargs):
+        original(*args, **kwargs)
+        raise RuntimeError("crash between the data and its log")
+
+    monkeypatch.setattr(ingest, "_write_run_log", explode)
+
+    with pytest.raises(RuntimeError):
+        ingest.run(con, VENUES, today=TODAY, backfill_days=5, chunk_days=30, fetch=Recorder())
+
+    assert con.execute("SELECT count(*) FROM pageviews").fetchone()[0] == 0, (
+        "the data must roll back with the log that describes it"
+    )
+    assert con.execute("SELECT count(*) FROM watermark").fetchone()[0] == 0
+
+
+def test_repeated_column_in_the_header_is_rejected(tmp_path):
+    """csv.DictReader keeps the last value, so a duplicated venue_id column files
+    every row under the wrong venue - silently."""
+    path = tmp_path / "v.csv"
+    path.write_text(
+        "venue_id,venue_name,region,wiki_article,venue_id\nreal,A,R,Art,other\n", encoding="utf-8"
+    )
+    with pytest.raises(ValueError, match="repeated column"):
+        ingest.read_venues(path)
+
+
+def test_a_title_in_a_different_unicode_form_is_normalised_on_read(tmp_path):
+    import unicodedata
+
+    path = tmp_path / "v.csv"
+    nfd = unicodedata.normalize("NFD", "Tūrangi")
+    path.write_text(
+        f"venue_id,venue_name,region,wiki_article\nt,Turangi,Waikato,{nfd}\n", encoding="utf-8"
+    )
+    venue = ingest.read_venues(path)[0]
+    assert venue.wiki_article == unicodedata.normalize("NFC", "Tūrangi")
+
+
+def test_plan_windows_rejects_a_chunk_size_that_would_not_advance():
+    """chunk_days=0 makes the cursor stand still - an infinite loop, not an error."""
+    with pytest.raises(ValueError):
+        ingest.plan_windows(date(2026, 1, 1), date(2026, 1, 10), 0)
+    with pytest.raises(ValueError):
+        ingest.plan_windows(date(2026, 1, 1), date(2026, 1, 10), -1)
+
+
+def test_watermark_stops_before_the_earliest_bad_day_of_several(con):
+    """With one bad day 'first' and 'last' are the same day, so min/max cannot be
+    told apart. Two bad days is what pins it."""
+    end = TODAY - timedelta(days=ingest.PUBLICATION_LAG_DAYS)
+    first_day = end - timedelta(days=9)
+    earlier, later = first_day + timedelta(days=3), first_day + timedelta(days=7)
+
+    ingest.run(
+        con,
+        VENUES,
+        today=TODAY,
+        backfill_days=10,
+        chunk_days=30,
+        max_reject_rate=1.0,
+        fetch=Poisoner("Milford_Sound", [earlier, later]),
+    )
+
+    assert ingest.get_watermark(con, "milford-sound") == earlier - timedelta(days=1)
+
+
+def test_a_bad_day_on_the_last_day_of_the_window_still_stops_the_watermark(con):
+    end = TODAY - timedelta(days=ingest.PUBLICATION_LAG_DAYS)
+
+    ingest.run(
+        con,
+        VENUES,
+        today=TODAY,
+        backfill_days=10,
+        chunk_days=30,
+        max_reject_rate=1.0,
+        fetch=Poisoner("Milford_Sound", [end]),
+    )
+
+    assert ingest.get_watermark(con, "milford-sound") == end - timedelta(days=1)
+
+
+def test_the_shipped_constants_are_what_the_readme_says():
+    """Every test computes its expectation from these, so all of them pass for any
+    value. The gate could be relaxed from 5% to 50% with a green suite."""
+    assert ingest.PUBLICATION_LAG_DAYS == 2
+    assert ingest.TRUST_LAG_DAYS == 7
+    assert ingest.DEFAULT_MAX_REJECT_RATE == 0.05
+    assert ingest.DEFAULT_CHUNK_DAYS == 30
+    assert ingest.DEFAULT_BACKFILL_DAYS == 90
+    assert ingest.DEFAULT_MAX_LOOKBACK_DAYS == 180
+
+
+def test_the_defaults_are_what_a_run_with_no_overrides_uses(con):
+    """Nothing else executes them: every other test passes each one explicitly."""
+    fetch = Recorder()
+    ingest.run(con, VENUES, today=TODAY, fetch=fetch)
+
+    milford = [call for call in fetch.calls if call[0] == "Milford_Sound"]
+    assert len(milford) == 3, "90 days in 30 day chunks"
+    assert sum((end - start).days + 1 for _, start, end in milford) == 90

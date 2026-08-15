@@ -160,11 +160,22 @@ def read_venues(path: str | Path) -> list[Venue]:
         missing = [column for column in VENUE_COLUMNS if column not in header]
         if missing:
             raise ValueError(f"{path}: missing column(s) {missing}; found {header}")
+        # csv.DictReader keeps the *last* value for a repeated column name, so a
+        # duplicated header silently discards the real value - or, for a repeated
+        # `venue_id`, files every row under the wrong venue.
+        repeated = sorted({column for column in header if header.count(column) > 1})
+        if repeated:
+            raise ValueError(f"{path}: repeated column(s) {repeated} in header {header}")
 
         venues: list[Venue] = []
         seen: dict[str, int] = {}
         for line, row in enumerate(reader, start=2):
-            fields = {column: (row.get(column) or "").strip() for column in VENUE_COLUMNS}
+            # NFC everywhere, so a macron typed as `u` + combining macron matches
+            # the API's single codepoint. See `quality.normalise_title`.
+            fields = {
+                column: quality.normalise_title((row.get(column) or "").strip())
+                for column in VENUE_COLUMNS
+            }
             blank = [column for column, value in fields.items() if not value]
             if blank:
                 raise ValueError(f"{path} line {line}: empty {blank}")
@@ -279,7 +290,7 @@ def run(
     today = today or datetime.now(UTC).date()
     end = today - timedelta(days=PUBLICATION_LAG_DAYS)
     floor = end - timedelta(days=max_lookback_days - 1)
-    trusted_end = today - timedelta(days=trust_lag_days)
+    calendar_trust_line = today - timedelta(days=trust_lag_days)
 
     run_id = uuid.uuid4().hex[:12]
     started_at = datetime.now(UTC)
@@ -289,6 +300,8 @@ def run(
     bad: list[quality.BadRow] = []
     new_watermarks: dict[str, date] = {}
     stalled: list[str] = []
+    silent: list[str] = []
+    fetched: list[tuple[Venue, date, list[quality.CleanRow], list[quality.BadRow]]] = []
 
     try:
         for venue in venues:
@@ -322,7 +335,30 @@ def run(
 
             clean.extend(venue_clean)
             bad.extend(venue_bad)
+            fetched.append((venue, start, venue_clean, venue_bad))
 
+        # How far the upstream has demonstrably published. Publication is a
+        # property of the API, not of one article, so the newest day seen for any
+        # venue - this run or in any run before it - is evidence for all of them.
+        #
+        # The calendar trust line alone was a fixed bet that the lag never runs
+        # longer than `trust_lag_days`. Once an absent day drifted past that line
+        # the watermark stepped over it whether or not anything had ever been
+        # published for that day, so a stall longer than
+        # `trust_lag_days - PUBLICATION_LAG_DAYS` lost days permanently, silently,
+        # with the run still reporting `ok`. Bounding the line by what has
+        # actually been seen makes a stall cost a re-request instead.
+        #
+        # With no evidence anywhere - an empty warehouse and a run that fetched
+        # nothing - the calendar line stands, so a set of venues that are all
+        # genuinely quiet still makes progress. That is the failure in the other
+        # direction, and it is the one the trust lag was introduced to avoid.
+        observed = _publication_frontier(con, clean)
+        trusted_end = calendar_trust_line
+        if observed is not None:
+            trusted_end = min(trusted_end, observed)
+
+        for venue, start, venue_clean, venue_bad in fetched:
             frontier = _venue_watermark(start, end, venue_clean, venue_bad, trusted_end)
             # Never move a watermark backwards. A venue already current past the
             # trust line would otherwise be dragged back to it and re-fetch the
@@ -331,36 +367,77 @@ def run(
             if frontier is not None and (current is None or frontier > current):
                 new_watermarks[venue.venue_id] = frontier
 
+            # A venue that has never produced a single row is the shape a typo in
+            # `venues.csv` makes: the API 404s at every width and slice, the
+            # window verifies as genuinely empty, and the run reports `ok` having
+            # quietly retired the whole backfill. Nothing else in the summary
+            # distinguishes that from a venue nobody reads.
+            if not venue_clean and not venue_bad and not _has_any_rows(con, venue.venue_id):
+                silent.append(f"{venue.venue_id}: no rows ever, check {venue.wiki_article!r}")
+
         summary.rows_quarantined = len(bad)
         # Record the rate before the gate can raise, so a failed run logs the
         # number that explains why it failed rather than 0.0.
         summary.reject_rate = quality.reject_rate(summary.rows_fetched, summary.rows_quarantined)
-        summary.note = "; ".join(stalled)
+        summary.note = "; ".join([*stalled, *silent])
         quality.enforce_gate(summary.rows_fetched, summary.rows_quarantined, max_reject_rate)
 
-        _load(con, run_id, clean, bad, new_watermarks)
+        # Set before the load, because the load is what writes the run log now.
         summary.rows_loaded = len(clean)
         summary.status = "ok"
+        _load(con, run_id, clean, bad, new_watermarks, summary, started_at)
 
     except Exception as exc:
         summary.status = "failed"
+        summary.rows_loaded = 0
         # Append rather than replace. A run that abandoned days and *then* failed
         # is the run whose note is worth most, and overwriting it lost the half
         # that does not turn up in the traceback. `stalled` is read here rather
         # than from summary.note because the failure may have come mid-loop,
         # before the note was composed at all.
-        summary.note = "; ".join([*stalled, f"{type(exc).__name__}: {exc}"])
+        summary.note = "; ".join([*stalled, *silent, f"{type(exc).__name__}: {exc}"])
+        # Nothing was loaded on this path - the transaction rolled back, or never
+        # opened - so this write stands alone and cannot contradict the data.
         _write_run_log(con, summary, started_at)
         raise
 
-    _write_run_log(con, summary, started_at)
     return summary
 
 
-def _load(con, run_id, clean, bad, new_watermarks) -> None:
+def _publication_frontier(con, clean: list[quality.CleanRow]) -> date | None:
+    """The newest day any venue has ever produced a row for, or None if none has.
+
+    Read from the warehouse as well as from this run, because during a stall this
+    run sees nothing at all: every venue's watermark already consumed everything
+    published, so each one asks for days beyond the frontier and gets an empty
+    answer. Judging on this run alone would fall back to the calendar line in
+    exactly the case the frontier exists to cover.
+    """
+    stored = con.execute("SELECT max(view_date) FROM pageviews").fetchone()[0]
+    seen = [row.view_date for row in clean]
+    if stored is not None:
+        seen.append(stored)
+    return max(seen) if seen else None
+
+
+def _has_any_rows(con, venue_id: str) -> bool:
+    row = con.execute("SELECT 1 FROM pageviews WHERE venue_id = ? LIMIT 1", [venue_id]).fetchone()
+    return row is not None
+
+
+def _load(con, run_id, clean, bad, new_watermarks, summary, started_at) -> None:
+    """Write the run: rows, quarantine, watermarks and the run log, atomically.
+
+    The run log is inside the transaction with the data it describes. Written
+    afterwards, as its own statement, it could be lost while the data survived -
+    a crash, or a `run_log` that has drifted a column - leaving rows in the
+    warehouse that no run ever claims to have loaded, and `sum(rows_loaded)`
+    quietly disagreeing with `count(*)`. A failed run has no data to disagree
+    with, so `run` writes its log separately on that path.
+    """
     now = datetime.now(UTC)
-    con.execute("BEGIN TRANSACTION")
     try:
+        con.execute("BEGIN TRANSACTION")
         if clean:
             con.executemany(
                 "INSERT OR REPLACE INTO pageviews "
@@ -384,9 +461,15 @@ def _load(con, run_id, clean, bad, new_watermarks) -> None:
                 "VALUES (?, ?, ?)",
                 [(vid, last, now) for vid, last in new_watermarks.items()],
             )
+        _write_run_log(con, summary, started_at)
         con.execute("COMMIT")
     except Exception:
-        con.execute("ROLLBACK")
+        # Guarded: a ROLLBACK that itself fails (the BEGIN never took, say) must
+        # not replace the error that explains what actually went wrong.
+        try:
+            con.execute("ROLLBACK")
+        except Exception:
+            pass
         raise
 
 
