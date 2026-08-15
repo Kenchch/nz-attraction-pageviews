@@ -212,7 +212,9 @@ def _subdivide(
         items = _fetch_once(
             article, piece_start, piece_end, opener=opener, max_attempts=max_attempts, sleep=sleep
         )
-        if items is None:
+        if not items:
+            # `None` is a 404, `[]` is a 200 naming no days at all. Neither is
+            # evidence, so both are taken apart further - see `fetch_window`.
             found.extend(
                 _subdivide(
                     article,
@@ -250,9 +252,14 @@ def fetch_window(
     that still comes back empty, by halving the window and asking about the pieces
     until either they give up their rows or they are single days. Only a window
     that is empty at every width and every slice is accepted as quiet.
+
+    "Empty" means empty, not 404. A 200 carrying `items: []` says exactly what the
+    404 says - no days - and deserves exactly as little trust. Verifying only the
+    404 left the same hole this function exists to close, reachable by an upstream
+    that reports nothing with a success code instead of an error one.
     """
     items = _fetch_once(article, start, end, opener=opener, max_attempts=max_attempts, sleep=sleep)
-    if items is not None:
+    if items:
         return items
 
     # Widening is a cheap way to get rows, never evidence that there are none.
