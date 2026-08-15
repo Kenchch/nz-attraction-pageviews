@@ -12,8 +12,16 @@ Two decisions worth defending in a review:
 
 from __future__ import annotations
 
+import unicodedata
 from dataclasses import dataclass
 from datetime import date, datetime
+
+# `pageviews.views` is a BIGINT. A larger int passes every other rule, becomes a
+# CleanRow, and then fails inside the driver as an unnamed conversion error -
+# which aborts the load for *every* venue, not just the one that sent it, and
+# does it again every night because no watermark advanced. A row the warehouse
+# cannot hold is a bad row, so it is rejected here like any other.
+VIEWS_MAX = 2**63 - 1
 
 
 class QualityGateFailed(RuntimeError):
@@ -88,6 +96,39 @@ def check_window(
     return clean, bad
 
 
+def normalise_title(title: str) -> str:
+    """One spelling of a title, so two spellings of the same one compare equal.
+
+    A macron can be written as one codepoint (NFC, `\\u016b`) or as `u` plus a
+    combining macron (NFD). Both render as `ū`, and macOS text entry and some
+    spreadsheets produce NFD, so a hand-edited `venues.csv` can disagree with the
+    API's NFC for a title that looks identical in every editor. Without this, a
+    venue like `Tūrangi` quarantines 100% of its rows for ever, under a `detail`
+    that reads `got 'Turangi', asked for 'Turangi'`.
+    """
+    return unicodedata.normalize("NFC", title)
+
+
+def _same_title(got: str, asked: str) -> bool:
+    return normalise_title(got) == normalise_title(asked)
+
+
+def _title_mismatch_detail(got: str, asked: str) -> str:
+    """Name the difference, adding the escaped form when it may not be visible.
+
+    Codepoints can differ while rendering identically, which produced quarantine
+    rows reading `got 'Tūrangi', asked for 'Tūrangi'` - true, and useless. Any
+    non-ASCII in play and the escapes go in too, so the row can be diagnosed from
+    the table rather than by pasting it into a hex editor.
+    """
+    plain = f"got {got!r}, asked for {asked!r}"
+    if got.isascii() and asked.isascii():
+        return plain
+    escaped_got = got.encode("unicode_escape").decode()
+    escaped_asked = asked.encode("unicode_escape").decode()
+    return f"{plain} ({escaped_got} vs {escaped_asked})"
+
+
 def _first_broken_rule(
     item: dict,
     *,
@@ -102,8 +143,8 @@ def _first_broken_rule(
     Rules are ordered cheapest and most fundamental first, so the reported rule is
     the root cause rather than a downstream symptom.
     """
-    if item["article"] != article:
-        return "article_matches_request", f"got {item['article']!r}, asked for {article!r}"
+    if not _same_title(item["article"], article):
+        return "article_matches_request", _title_mismatch_detail(item["article"], article)
 
     try:
         view_date = parse_timestamp(item["timestamp"])
@@ -122,6 +163,9 @@ def _first_broken_rule(
 
     if views < 0:
         return "views_non_negative", f"got {views}"
+
+    if views > VIEWS_MAX:
+        return "views_within_bigint", f"got {views}, above the {VIEWS_MAX} the column holds"
 
     if view_date in seen:
         return "one_row_per_date", f"{view_date} already seen with {seen[view_date]} views"
