@@ -191,3 +191,13 @@ def test_the_first_rule_reported_is_the_root_cause():
 def test_a_rate_exactly_on_the_threshold_passes():
     """The boundary the gate is written to allow: `>` not `>=`."""
     assert quality.enforce_gate(fetched=100, quarantined=5, max_reject_rate=0.05) == 0.05
+
+
+def test_a_non_string_article_is_quarantined_not_raised():
+    """`_parse` checks the field is present, never its type, so a drifted null or
+    number reaches the comparison. Raising there would abort the load for every
+    venue in the run, and again every night, since no watermark advances."""
+    for wrong in (None, 123, ["Milford_Sound"]):
+        clean, bad = check([item(article=wrong)])
+        assert clean == [], wrong
+        assert bad[0].rule == "article_matches_request", wrong

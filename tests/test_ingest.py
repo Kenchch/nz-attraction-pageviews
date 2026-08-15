@@ -947,3 +947,50 @@ def test_the_defaults_are_what_a_run_with_no_overrides_uses(con):
     milford = [call for call in fetch.calls if call[0] == "Milford_Sound"]
     assert len(milford) == 3, "90 days in 30 day chunks"
     assert sum((end - start).days + 1 for _, start, end in milford) == 90
+
+
+def test_a_spreadsheet_csv_with_trailing_commas_still_reads(tmp_path):
+    """Excel ends every line with the same stray commas; DictReader names them all
+    `''`. Only the four columns actually read can be ambiguous."""
+    path = tmp_path / "v.csv"
+    path.write_text(
+        "venue_id,venue_name,region,wiki_article,,\nte-papa,Te Papa,Wellington,Te_Papa,,\n",
+        encoding="utf-8",
+    )
+    assert ingest.read_venues(path)[0].wiki_article == "Te_Papa"
+
+
+def test_a_venue_id_is_left_exactly_as_written(tmp_path):
+    """It is the key every stored row is written under. Re-spelling it would
+    orphan an existing warehouse's watermark and duplicate its history under an
+    id that looks identical on screen."""
+    import unicodedata
+
+    nfd_id = unicodedata.normalize("NFD", "tūrangi")
+    path = tmp_path / "v.csv"
+    path.write_text(
+        f"venue_id,venue_name,region,wiki_article\n{nfd_id},T,Waikato,Tūrangi\n", encoding="utf-8"
+    )
+
+    venue = ingest.read_venues(path)[0]
+    assert venue.venue_id == nfd_id, "the id is ours and is never compared with the API"
+    assert venue.wiki_article == unicodedata.normalize("NFC", "Tūrangi"), "the title is theirs"
+
+
+def test_a_venue_falling_behind_is_named_in_the_note(con):
+    """Holding is right - it re-requests rather than losing days - but a venue
+    that stops advancing should not be something you have to notice yourself."""
+    end = TODAY - timedelta(days=ingest.PUBLICATION_LAG_DAYS)
+    ingest.run(con, VENUES, today=TODAY, backfill_days=10, chunk_days=30, fetch=Recorder())
+
+    def nothing_new(article, start, end):
+        return []
+
+    later = TODAY + timedelta(days=ingest.TRUST_LAG_DAYS + 4)
+    summary = ingest.run(
+        con, VENUES, today=later, backfill_days=10, chunk_days=30, fetch=nothing_new
+    )
+
+    assert "milford-sound" in summary.note
+    assert "days behind" in summary.note
+    assert ingest.get_watermark(con, "milford-sound") == end, "and it is holding, not losing"

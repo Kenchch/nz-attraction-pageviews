@@ -109,11 +109,22 @@ def normalise_title(title: str) -> str:
     return unicodedata.normalize("NFC", title)
 
 
-def _same_title(got: str, asked: str) -> bool:
+def _same_title(got, asked: str) -> bool:
+    """Compare titles, tolerating an `article` that is not a string at all.
+
+    `!=` accepted anything; `unicodedata.normalize` raises TypeError on a non-str,
+    and `_parse` checks only that the field is *present*. So a drifted `null` or
+    number here would abort the whole run - every venue, every night, since no
+    watermark advances - which is the failure `views_within_bigint` exists to
+    prevent, two rules further down. A row with a non-string article is simply a
+    row that does not match, and is quarantined like any other mismatch.
+    """
+    if not isinstance(got, str) or not isinstance(asked, str):
+        return got == asked
     return normalise_title(got) == normalise_title(asked)
 
 
-def _title_mismatch_detail(got: str, asked: str) -> str:
+def _title_mismatch_detail(got, asked: str) -> str:
     """Name the difference, adding the escaped form when it may not be visible.
 
     Codepoints can differ while rendering identically, which produced quarantine
@@ -122,6 +133,8 @@ def _title_mismatch_detail(got: str, asked: str) -> str:
     the table rather than by pasting it into a hex editor.
     """
     plain = f"got {got!r}, asked for {asked!r}"
+    if not isinstance(got, str) or not isinstance(asked, str):
+        return plain
     if got.isascii() and asked.isascii():
         return plain
     escaped_got = got.encode("unicode_escape").decode()
