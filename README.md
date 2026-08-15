@@ -22,7 +22,7 @@ pip install -r requirements.txt
 
 python demo.py                     # offline, synthetic API, no network needed
 python -m nz_attraction_pageviews  # live, hits the Wikimedia API
-pytest -q                          # 85 tests, all offline
+pytest -q                          # 114 tests, all offline
 ```
 
 `demo.py` output:
@@ -79,6 +79,11 @@ The live count is deliberately not quoted, because it does not hold still: the
 same 2026-07-13..2026-08-11 window that 404'd eight times out of eight later
 answered 200 on the first request. That is the argument for verifying rather
 than measuring once and hard-coding what you saw.
+
+"Empty" means empty, not 404. A 200 carrying `items: []` says exactly what the
+404 says — no days — and gets exactly the same scrutiny. Verifying only the 404
+left the identical hole open to any upstream that reports nothing with a
+success code instead of an error one, and it costs one request to close.
 
 A 200 gets no more benefit of the doubt than the 404 did. Widening is treated as
 a cheap way to *get* rows, never as evidence that there are none, so the
@@ -150,8 +155,22 @@ Two things do resolve it. Publication runs in date order, so *anything before a
 day that did arrive is settled* — a later day arriving proves the earlier one was
 published, and its absence can only mean quiet. Past that, only age: an absent
 day older than `TRUST_LAG_DAYS` is taken as quiet, a more recent one is left
-alone and asked for again next run. So the watermark advances to the last day
-actually loaded, holes behind it included, or to the trust line, whichever is
+alone and asked for again next run.
+
+Age alone is a bet, though, and the stake is permanent. `TRUST_LAG_DAYS` minus
+`PUBLICATION_LAG_DAYS` is five days of margin, and a publication stall longer
+than that walked the watermark over days nothing had ever published, one per
+night, with every run still reporting `ok`; a lag that settled above seven days
+overtook the frontier for good and the venue never loaded another row. So the
+trust line is also bounded by the newest day *any* venue has produced a row for,
+this run or in any run before it — publication is a property of the API, not of
+one article. During a stall that frontier stops, the trust line stops with it,
+and the days cost a re-request instead of vanishing. With no evidence anywhere,
+an empty warehouse and a run that fetched nothing, the calendar line stands, so
+venues that are all genuinely quiet still make progress.
+
+So the watermark advances to the last day actually loaded, holes behind it
+included, or to the trust line, whichever is
 further — and never past a quarantined day *inside the range it asked for*,
 whatever its age. A rejected row dated outside that range is still recorded in
 `quarantine`, but it does not hold the watermark: the watermark only promises
@@ -223,11 +242,12 @@ Applied per row, in this order:
 | `date_not_in_future` | A date after today |
 | `views_is_integer` | Strings, floats, and `True` (which would otherwise load as 1) |
 | `views_non_negative` | Negative counts |
+| `views_within_bigint` | Counts too large for the column, which would fail the load itself |
 | `one_row_per_date` | A second row for a date already seen in the window |
 
 ## Testing
 
-85 tests, no network. The HTTP call is injected into `fetch_window` and the
+114 tests, no network. The HTTP call is injected into `fetch_window` and the
 fetcher is injected into `ingest.run`, so the suite drives real code paths with
 stubbed transport rather than mocking out the logic being tested.
 
@@ -275,6 +295,21 @@ CI runs lint, format check, and tests on Python 3.10 through 3.13.
   venues that is affordable, and the alternative is losing days silently. At
   several hundred it would need a memo of which windows have already been
   verified empty, so a backfill does not re-derive the same nothing every night.
+- Verification is not free in the ordinary case either, not just the pathological
+  one. A venue whose recent days are genuinely absent re-asks for them every
+  night, and each of those windows now 404s or answers empty and is verified in
+  full — roughly 13 requests where a venue with traffic costs 1. At eight venues
+  that is affordable; at several hundred it would need a memo of which windows
+  have already been verified empty.
+- A typo in `venues.csv` looks exactly like a quiet venue: the article does not
+  exist, every width and slice 404s, and the window verifies as genuinely empty.
+  A venue that has never produced a single row is therefore named in
+  `run_log.note`, since nothing else in the summary tells the two apart.
+- The trust line is bounded by the newest day any venue has ever returned. If the
+  upstream genuinely publishes nothing at all for a stretch — every venue, every
+  day — no watermark advances during it. That is deliberate: the alternative is
+  the silent loss it replaced. It does mean a warehouse with a single, very quiet
+  venue leans on the calendar line more than a warehouse with eight.
 - `run_log.requests` counts windows asked for, not HTTP calls. Verification can
   turn one window into several calls, so the two diverge exactly when the API is
   misbehaving.
@@ -302,6 +337,12 @@ Wikimedia Analytics pageviews API, `per-article` daily, `all-access`, `user`
 agent (bots excluded). No API key. Wikimedia asks for a contactable User-Agent,
 set in `nz_attraction_pageviews/client.py` — change it to your own before running
 the live path.
+
+Titles are normalised to NFC on read. A macron is one codepoint in NFC and two
+in NFD; both render as `ū`, macOS text entry and some spreadsheets produce NFD,
+and the API answers in NFC — so an un-normalised `Tūrangi` would quarantine
+every row it ever fetched, under a `detail` reading `got 'Tūrangi', asked for
+'Tūrangi'`.
 
 Titles in `venues.csv` must be canonical, not redirects. The pageviews API is
 title-exact and does not follow redirects, so a redirect title returns only the
