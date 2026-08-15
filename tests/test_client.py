@@ -470,3 +470,104 @@ def test_non_object_item_raises_schema_drift_not_a_bare_typeerror(item):
     opener = Opener((200, {}, b'{"items": [%s]}' % item.encode()))
     with pytest.raises(client.SchemaDriftError, match="expected an object"):
         client.fetch_window("Milford_Sound", date(2026, 1, 1), date(2026, 1, 1), opener=opener)
+
+
+class EmptyWideApi:
+    """The success-code twin of `WidthSensitiveApi`: anything wider than
+    `max_span_days` answers 200 with no rows at all, narrower spans answer with
+    the days they cover."""
+
+    def __init__(self, max_span_days):
+        self.max_span_days = max_span_days
+        self.urls = []
+
+    def __call__(self, url):
+        self.urls.append(url)
+        tail = url.rsplit("/daily/", 1)[1].split("/")
+        start = datetime.strptime(tail[0], "%Y%m%d").date()
+        end = datetime.strptime(tail[1], "%Y%m%d").date()
+        if (end - start).days + 1 > self.max_span_days:
+            return 200, {}, b'{"items": []}'
+
+        stamps, cursor = [], start
+        while cursor <= end:
+            stamps.append(f"{cursor:%Y%m%d}00")
+            cursor += timedelta(days=1)
+        return 200, {}, days(*stamps)
+
+
+def test_an_empty_200_is_verified_exactly_like_a_404():
+    """`{"items": []}` says what the 404 says - no days - so it earns the same
+    scrutiny. Verifying only the 404 left the identical hole open to any upstream
+    that reports nothing with a success code."""
+    opener = Opener((200, {}, b'{"items": []}'))
+    rows = client.fetch_window(
+        "Waitomo_Glowworm_Cave", date(2026, 1, 1), date(2026, 1, 5), opener=opener
+    )
+    assert rows == []
+    assert len(opener.urls) > 1 + len(client.VERIFY_PADS), (
+        "an empty 200 should widen and subdivide before it is believed"
+    )
+
+
+def test_a_window_that_answers_empty_but_slices_into_rows_is_recovered():
+    api = EmptyWideApi(max_span_days=7)
+    rows = client.fetch_window(
+        "Hobbiton_Movie_Set", date(2026, 7, 13), date(2026, 8, 11), opener=api
+    )
+    assert len(rows) == 30, "an empty 200 hides days exactly as a 404 does"
+    assert [r["timestamp"] for r in rows] == sorted(r["timestamp"] for r in rows)
+
+
+def test_a_200_with_rows_is_still_taken_at_face_value():
+    """Only an *empty* answer is suspect; a window that answered costs one call."""
+    opener = Opener((200, {}, canned(500)))
+    rows = client.fetch_window(
+        "Sky_Tower_(Auckland)", date(2026, 1, 1), date(2026, 1, 1), opener=opener
+    )
+    assert [r["views"] for r in rows] == [500]
+    assert len(opener.urls) == 1
+
+
+def test_max_backoff_is_two_minutes():
+    """Pinned to the literal: asserting against the constant passes for any value."""
+    assert client.MAX_BACKOFF_SECONDS == 120.0
+
+
+def test_default_max_attempts_is_four():
+    opener = Opener((500, {}, b""))
+    with pytest.raises(client.ApiError):
+        client.fetch_window(
+            "Milford_Sound", date(2026, 1, 1), date(2026, 1, 1), opener=opener, sleep=lambda _: None
+        )
+    assert len(opener.urls) == 4, "the shipped default, not one a test passed in"
+
+
+def test_backoff_does_not_sleep_after_the_last_attempt():
+    slept = []
+    opener = Opener((503, {}, b""))
+    with pytest.raises(client.ApiError):
+        client.fetch_window(
+            "Milford_Sound",
+            date(2026, 1, 1),
+            date(2026, 1, 1),
+            opener=opener,
+            max_attempts=3,
+            sleep=slept.append,
+        )
+    assert len(slept) == 2, "a sleep before giving up buys nothing and costs two minutes"
+
+
+def test_backoff_is_the_documented_powers_of_two():
+    slept = []
+    opener = Opener((503, {}, b""), (503, {}, b""), (200, {}, canned()))
+    client.fetch_window(
+        "Milford_Sound", date(2026, 1, 1), date(2026, 1, 1), opener=opener, sleep=slept.append
+    )
+    assert 2.0 <= slept[0] < 2.5
+    assert 4.0 <= slept[1] < 4.5
+
+
+def test_backoff_jitter_actually_varies():
+    """Without jitter every venue's retry lands on the same second."""
+    assert len({client._backoff_seconds(2, {}) for _ in range(20)}) > 1
