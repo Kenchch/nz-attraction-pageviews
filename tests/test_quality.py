@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import unicodedata
 from datetime import date
 
 import pytest
@@ -116,3 +117,77 @@ def test_gate_fails_over_threshold():
 
 def test_gate_handles_empty_run():
     assert quality.enforce_gate(fetched=0, quarantined=0, max_reject_rate=0.05) == 0.0
+
+
+def test_zero_views_is_clean_not_quarantined():
+    """A day the API does report as zero is data, not a defect."""
+    clean, bad = check([item(views=0)])
+    assert bad == []
+    assert clean[0].views == 0
+
+
+def test_views_too_large_for_the_column_is_quarantined():
+    """`pageviews.views` is a BIGINT. Without a ceiling the row passes every other
+    rule, becomes a CleanRow, and fails inside the driver instead - which aborts
+    the load for every venue in the run, and does it again every night because no
+    watermark advanced."""
+    clean, bad = check([item(views=2**63)])
+    assert clean == []
+    assert bad[0].rule == "views_within_bigint"
+
+
+def test_the_largest_value_the_column_holds_is_clean():
+    clean, bad = check([item(views=2**63 - 1)])
+    assert bad == []
+    assert clean[0].views == 2**63 - 1
+
+
+def test_a_title_differing_only_by_unicode_form_matches():
+    """`ū` is one codepoint in NFC and two in NFD; both render identically. macOS
+    text entry and some spreadsheets produce NFD and the API answers NFC, so
+    without normalising, a venue like Tūrangi quarantines every row for ever."""
+    nfd = unicodedata.normalize("NFD", "Tūrangi")
+    nfc = unicodedata.normalize("NFC", "Tūrangi")
+    assert nfd != nfc, "the two forms really are different strings"
+
+    clean, bad = quality.check_window(
+        [item(article=nfd)], venue_id="turangi", article=nfc, start=START, end=END, today=TODAY
+    )
+    assert bad == [], "the same title in two encodings is the same title"
+    assert clean[0].views == 120
+
+
+def test_a_non_ascii_title_mismatch_shows_the_escaped_form():
+    """`got 'Tūrangi', asked for 'Tūrangi'` is a true and useless quarantine row."""
+    _, bad = quality.check_window(
+        [item(article="Tūrangi")], venue_id="v", article="Taupō", start=START, end=END, today=TODAY
+    )
+    assert bad[0].rule == "article_matches_request"
+    assert "\\u016b" in bad[0].detail, bad[0].detail
+
+
+def test_a_digit_timestamp_of_the_wrong_length_is_rejected():
+    """Truncating it would turn schema drift into a plausible-looking date."""
+    with pytest.raises(ValueError):
+        quality.parse_timestamp("2026010100999")
+    with pytest.raises(ValueError):
+        quality.parse_timestamp("202601")
+
+
+def test_the_first_rule_reported_is_the_root_cause():
+    """A row outside the window *and* in the future is out of window first."""
+    clean, bad = quality.check_window(
+        [item(timestamp="2026061500")],
+        venue_id="v",
+        article=ARTICLE,
+        start=START,
+        end=END,
+        today=date(2026, 2, 1),
+    )
+    assert clean == []
+    assert bad[0].rule == "date_in_requested_window"
+
+
+def test_a_rate_exactly_on_the_threshold_passes():
+    """The boundary the gate is written to allow: `>` not `>=`."""
+    assert quality.enforce_gate(fetched=100, quarantined=5, max_reject_rate=0.05) == 0.05
