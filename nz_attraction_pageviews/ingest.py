@@ -17,6 +17,7 @@ the other five.
 from __future__ import annotations
 
 import csv
+import math
 import uuid
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
@@ -293,6 +294,28 @@ def run(
     trust_lag_days: int = TRUST_LAG_DAYS,
     fetch=client.fetch_window,
 ) -> RunSummary:
+    # Validated rather than trusted, because the failure modes are silent. A
+    # max_reject_rate of nan disables the gate outright - every comparison
+    # against nan is False, so no rate is ever "too high" and a run that
+    # rejected everything still reports ok. A backfill_days of 0 asks for an
+    # empty range and looks like a venue with no traffic.
+    for name, value in (
+        ("chunk_days", chunk_days),
+        ("backfill_days", backfill_days),
+        ("max_lookback_days", max_lookback_days),
+        ("trust_lag_days", trust_lag_days),
+    ):
+        if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+            raise ValueError(f"{name} must be an integer >= 1, got {value!r}")
+    if not isinstance(max_reject_rate, (int, float)) or isinstance(max_reject_rate, bool):
+        raise ValueError(f"max_reject_rate must be a number, got {max_reject_rate!r}")
+    if not math.isfinite(max_reject_rate) or not 0.0 <= max_reject_rate <= 1.0:
+        raise ValueError(
+            f"max_reject_rate must be a finite fraction in [0, 1], got {max_reject_rate!r}. "
+            f"nan in particular disables the gate silently: every comparison against it "
+            f"is False, so no run is ever rejected."
+        )
+
     today = today or datetime.now(UTC).date()
     end = today - timedelta(days=PUBLICATION_LAG_DAYS)
     floor = end - timedelta(days=max_lookback_days - 1)
