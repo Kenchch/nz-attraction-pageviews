@@ -22,7 +22,7 @@ pip install -r requirements.txt
 
 python demo.py                     # offline, synthetic API, no network needed
 python -m nz_attraction_pageviews  # live, hits the Wikimedia API
-pytest -q                          # 119 tests, all offline
+pytest -q                          # 120 tests, all offline
 ```
 
 `demo.py` output:
@@ -251,13 +251,15 @@ Applied per row, in this order:
 
 ## Testing
 
-119 tests, no network. The HTTP call is injected into `fetch_window` and the
+120 tests, no network. The HTTP call is injected into `fetch_window` and the
 fetcher is injected into `ingest.run`, so the suite drives real code paths with
 stubbed transport rather than mocking out the logic being tested.
 
 Covered: URL quoting for titles like `Sky_Tower_(Auckland)`, 404 verified before
 it is believed and accepted as empty only when every widening and every slice
-agrees, a widened 200 that mentions none of the requested days subdivided rather
+agrees, a first widening that answers 200 with pad-region rows only still falling
+through to the second widening rather than spending its silence as evidence,
+a widened 200 that mentions none of the requested days subdivided rather
 than believed, a window that answers only in slices stitched back together in
 order, subdivision recursing only into the pieces that failed, recovered rows
 trimmed to the requested window on both paths, an item that is not an object
