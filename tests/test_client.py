@@ -624,3 +624,53 @@ def test_an_empty_pad_is_not_evidence_either():
     )
     assert [r["timestamp"] for r in rows] == ["2026010100"], "the second pad had it"
     assert len(opener.urls) == 3
+
+
+def test_a_response_answering_a_different_question_is_drift_not_a_clean_row():
+    """The four descriptor fields say WHAT was counted, and nothing downstream
+    reads them.
+
+    Field presence was checked; values were not. Every acceptance rule in
+    quality.py judges the date and the count, so a reply describing German
+    Wikipedia, monthly granularity, desktop access and spider traffic passed
+    straight through: verified before this check existed as 1 clean row and 0
+    quarantined, carrying a month of bot traffic under a single New Zealand day
+    and advancing the watermark past it.
+
+    It stops the run rather than quarantining the row: the request and the
+    response disagree about the question, so every other row in the payload is
+    equally suspect.
+    """
+    good = {
+        "project": client.PROJECT,
+        "article": "Te_Papa",
+        "granularity": "daily",
+        "timestamp": "2026030100",
+        "access": client.ACCESS,
+        "agent": client.AGENT,
+        "views": 12,
+    }
+    assert client._parse(json.dumps({"items": [good]}).encode(), "Te_Papa") == [good]
+
+    for field, wrong in (
+        ("project", "de.wikipedia"),
+        ("granularity", "monthly"),
+        ("access", "desktop"),
+        ("agent", "spider"),
+    ):
+        payload = {"items": [{**good, field: wrong}]}
+        with pytest.raises(client.SchemaDriftError, match=field):
+            client._parse(json.dumps(payload).encode(), "Te_Papa")
+
+    with pytest.raises(client.SchemaDriftError, match="timestamp"):
+        client._parse(
+            json.dumps({"items": [{**good, "timestamp": 2026030100}]}).encode(), "Te_Papa"
+        )
+
+
+def test_a_top_level_json_that_is_not_an_object_is_named_drift():
+    """payload.get() on a list raised AttributeError from inside _parse, naming
+    neither the article nor the problem."""
+    for body in (b"[]", b'"a string"', b"123"):
+        with pytest.raises(client.SchemaDriftError, match="top-level JSON"):
+            client._parse(body, "Te_Papa")

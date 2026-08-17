@@ -122,6 +122,13 @@ def _parse(body: bytes, article: str) -> list[dict]:
     except json.JSONDecodeError as exc:
         raise SchemaDriftError(f"{article}: body is not JSON ({exc})") from exc
 
+    if not isinstance(payload, dict):
+        # payload.get() on a list or a string raises AttributeError from inside
+        # this function, which names neither the article nor the problem.
+        raise SchemaDriftError(
+            f"{article}: top-level JSON is {type(payload).__name__}, expected an object"
+        )
+
     items = payload.get("items")
     if items is None:
         raise SchemaDriftError(f"{article}: response has no 'items' key")
@@ -136,6 +143,35 @@ def _parse(body: bytes, article: str) -> list[dict]:
         missing = EXPECTED_FIELDS - set(item)
         if missing:
             raise SchemaDriftError(f"{article}: item missing fields {sorted(missing)}")
+
+        # Presence was never the risk. These four fields describe WHAT was
+        # counted, and a response answering with different ones is not an error
+        # anywhere downstream: every acceptance rule in quality.py judges the
+        # date and the count, so a de.wikipedia / monthly / desktop / spider row
+        # arrived as a clean row carrying a month of German bot traffic under a
+        # single New Zealand day, loaded, and advanced the watermark past it.
+        # Verified before this check existed: 1 clean row, 0 quarantined.
+        #
+        # This is drift, not a bad row, so it stops the run rather than being
+        # quarantined - it means the request and the response disagree about the
+        # question, and every other row in the response is equally suspect.
+        for field, expected in (
+            ("project", PROJECT),
+            ("granularity", "daily"),
+            ("access", ACCESS),
+            ("agent", AGENT),
+        ):
+            if item[field] != expected:
+                raise SchemaDriftError(
+                    f"{article}: {field} is {item[field]!r}, expected {expected!r}. "
+                    f"The response is not answering the question the URL asked."
+                )
+        if not isinstance(item["timestamp"], str):
+            # parse_timestamp would coerce an int and quietly succeed on some
+            # values, so the type is checked where the contract is stated.
+            raise SchemaDriftError(
+                f"{article}: timestamp is {type(item['timestamp']).__name__}, expected str"
+            )
     return items
 
 

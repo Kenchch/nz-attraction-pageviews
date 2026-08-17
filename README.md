@@ -22,7 +22,7 @@ pip install -r requirements.txt
 
 python demo.py                     # offline, synthetic API, no network needed
 python -m nz_attraction_pageviews  # live, hits the Wikimedia API
-pytest -q                          # 120 tests, all offline
+pytest -q                          # 122 tests, all offline
 ```
 
 `demo.py` output:
@@ -114,13 +114,24 @@ proxy answering `86400` would park a nightly job for a day, and `float` accepts
 at a few minutes, after which the window fails loudly and the watermark stays
 put — so the days are asked for again tomorrow rather than lost.
 
-**3. A missing field is schema drift, and it stops the run.**
+**3. A missing field is schema drift, and so is a wrong value.**
 `EXPECTED_FIELDS` is the contract. If the API drops a field, the run fails with
 the field name in the message. The alternative is that the field silently
 becomes NULL and surfaces three tables downstream as a chart with a gap in it.
 An item that is not an object at all — a bare number where a row should be —
 is the same failure and gets the same named error, rather than a `TypeError`
 thrown from inside a set operation with nothing in it to say which article.
+
+Presence was never the whole risk. `project`, `granularity`, `access` and
+`agent` say *what was counted*, and nothing downstream reads them: every
+acceptance rule below judges the date and the count. So a reply describing
+`de.wikipedia`, `monthly`, `desktop`, `spider` passed straight through as a
+clean row — a month of German bot traffic stored under one New Zealand day,
+loaded, with the watermark advanced past it. Measured before the check
+existed: 1 clean row, 0 quarantined. These four are now compared against what
+the URL asked for, and a mismatch stops the run rather than quarantining one
+row, because the request and the response disagree about the question and
+every other row in the payload is equally suspect.
 
 **4. Bad rows are quarantined, not dropped — and the watermark respects that.**
 Every rejected row lands in `quarantine` with the rule it broke and its raw
@@ -251,7 +262,7 @@ Applied per row, in this order:
 
 ## Testing
 
-120 tests, no network. The HTTP call is injected into `fetch_window` and the
+122 tests, no network. The HTTP call is injected into `fetch_window` and the
 fetcher is injected into `ingest.run`, so the suite drives real code paths with
 stubbed transport rather than mocking out the logic being tested.
 
