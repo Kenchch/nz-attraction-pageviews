@@ -274,6 +274,44 @@ def test_a_widened_200_carrying_only_pad_days_still_recovers_the_window():
     assert all(r["timestamp"] >= "2026071300" for r in rows), "pad days must not leak in"
 
 
+def test_first_pad_with_only_outside_rows_does_not_hide_second_pad():
+    """A padding-only 200 at the first pad must not stop the second pad running.
+
+    `test_a_widened_200_carrying_only_pad_days_still_recovers_the_window` above
+    survives this bug, because its slices answer and subdivision rescues the
+    window. Here nothing answers except the second pad: the direct window 404s,
+    every slice down to single days 404s, and the first pad replies 200 with a
+    row from the pad region only. Breaking on that raw 200 spent the first pad's
+    silence as the second pad's evidence and returned zero rows for three days
+    that exist - with the run still reporting ok, because rows that never
+    arrived are never rejected.
+    """
+
+    class OnlySecondPadAnswers:
+        def __init__(self):
+            self.spans = []
+
+        def __call__(self, url):
+            tail = url.rsplit("/daily/", 1)[1].split("/")
+            s = datetime.strptime(tail[0], "%Y%m%d").date()
+            e = datetime.strptime(tail[1], "%Y%m%d").date()
+            self.spans.append((e - s).days)
+            if s == date(2026, 3, 10) - timedelta(days=client.VERIFY_PADS[0]):
+                return 200, {}, days("2026030100")          # pad region only
+            if s == date(2026, 3, 10) - timedelta(days=client.VERIFY_PADS[1]):
+                return 200, {}, days("2026031000", "2026031100", "2026031200")
+            return 404, {}, b""                             # window and every slice
+
+    api = OnlySecondPadAnswers()
+    rows = client.fetch_window(
+        "Waitomo_Glowworm_Cave", date(2026, 3, 10), date(2026, 3, 12), opener=api
+    )
+
+    second_pad_span = 2 + client.VERIFY_PADS[1]
+    assert second_pad_span in api.spans, "the second pad was never asked"
+    assert [r["timestamp"] for r in rows] == ["2026031000", "2026031100", "2026031200"]
+
+
 def test_a_partial_widened_200_is_completed_by_subdividing():
     """Returning early on a partial answer left the omitted days for the watermark
     to notice. They are recoverable here, so they are recovered here."""
