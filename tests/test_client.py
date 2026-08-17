@@ -297,10 +297,10 @@ def test_first_pad_with_only_outside_rows_does_not_hide_second_pad():
             e = datetime.strptime(tail[1], "%Y%m%d").date()
             self.spans.append((e - s).days)
             if s == date(2026, 3, 10) - timedelta(days=client.VERIFY_PADS[0]):
-                return 200, {}, days("2026030100")          # pad region only
+                return 200, {}, days("2026030100")  # pad region only
             if s == date(2026, 3, 10) - timedelta(days=client.VERIFY_PADS[1]):
                 return 200, {}, days("2026031000", "2026031100", "2026031200")
-            return 404, {}, b""                             # window and every slice
+            return 404, {}, b""  # window and every slice
 
     api = OnlySecondPadAnswers()
     rows = client.fetch_window(
