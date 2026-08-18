@@ -201,3 +201,34 @@ def test_a_non_string_article_is_quarantined_not_raised():
         clean, bad = check([item(article=wrong)])
         assert clean == [], wrong
         assert bad[0].rule == "article_matches_request", wrong
+
+
+@pytest.mark.parametrize(
+    "timestamp,ok",
+    [
+        ("2026031000", True),  # the only daily shape
+        ("2026031012", False),  # an hour, not a day
+        ("2026031001", False),
+        ("202603100", False),  # nine digits
+        ("20260310AB", False),
+        ("", False),
+    ],
+)
+def test_only_a_daily_timestamp_is_accepted(timestamp, ok):
+    """The trailing 00 is the "daily" in a daily timestamp.
+
+    Checking only for ten digits let an hourly stamp through: 2026031012 parsed
+    as 10 March and loaded as that day's total when it is one hour of it.
+    `one_row_per_date` catches a *second* hour for the same day, but the first
+    arrives looking exactly like a legitimate daily figure.
+
+    A non-string timestamp is deliberately not tested here: parse_timestamp
+    coerces with str(), and the type is enforced one layer earlier, by
+    client._parse, so it never reaches this function as an int. See
+    test_a_response_answering_a_different_question_is_drift_not_a_clean_row.
+    """
+    if ok:
+        assert quality.parse_timestamp(timestamp) == date(2026, 3, 10)
+    else:
+        with pytest.raises(ValueError, match="YYYYMMDD00"):
+            quality.parse_timestamp(timestamp)

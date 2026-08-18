@@ -994,3 +994,32 @@ def test_a_venue_falling_behind_is_named_in_the_note(con):
     assert "milford-sound" in summary.note
     assert "days behind" in summary.note
     assert ingest.get_watermark(con, "milford-sound") == end, "and it is holding, not losing"
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        10**1000,  # math.isfinite() converts to float and overflows
+        float("nan"),  # every comparison against nan is False: no gate at all
+        float("inf"),
+        1.5,
+        -0.1,
+        "0.05",
+    ],
+)
+def test_an_unusable_reject_rate_is_refused(value):
+    """nan is the sharp one: it disables the gate outright, so a run that
+    rejected everything still reports ok. 10**1000 used to reach math.isfinite()
+    and raise OverflowError out of the validator whose job is a clean message."""
+    with pytest.raises(ValueError, match="max_reject_rate"):
+        ingest.run(None, [], max_reject_rate=value)
+
+
+@pytest.mark.parametrize(
+    "name", ["chunk_days", "backfill_days", "max_lookback_days", "trust_lag_days"]
+)
+@pytest.mark.parametrize("value", [0, -1, 1.5, True])
+def test_an_unusable_interval_is_refused(name, value):
+    """backfill_days=0 asks for an empty range and looks like a quiet venue."""
+    with pytest.raises(ValueError, match=name):
+        ingest.run(None, [], **{name: value})

@@ -674,3 +674,20 @@ def test_a_top_level_json_that_is_not_an_object_is_named_drift():
     for body in (b"[]", b'"a string"', b"123"):
         with pytest.raises(client.SchemaDriftError, match="top-level JSON"):
             client._parse(body, "Te_Papa")
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        b'\xff\xfe{"items":[]}',  # invalid bytes at the start
+        b'{"items":[{"article":"\xff\xfe"}]}',  # invalid bytes inside a string
+        b"\x80\x81\x82",  # not JSON and not UTF-8
+    ],
+)
+def test_a_body_that_is_not_utf8_json_is_named_drift(body):
+    """json.loads on bytes sniffs the encoding and copes with a leading BOM, so
+    only the first of these surfaced as a JSONDecodeError and looked handled.
+    The other two raised a bare UnicodeDecodeError out of _parse, naming neither
+    the article nor the contract."""
+    with pytest.raises(client.SchemaDriftError, match="UTF-8 JSON"):
+        client._parse(body, "Te_Papa")
