@@ -12,6 +12,7 @@ Two decisions worth defending in a review:
 
 from __future__ import annotations
 
+import re
 import unicodedata
 from dataclasses import dataclass
 from datetime import date, datetime
@@ -49,8 +50,13 @@ class BadRow:
 def parse_timestamp(value) -> date:
     """Wikimedia sends daily timestamps as YYYYMMDD00."""
     text = str(value)
-    if len(text) != 10 or not text.isdigit():
-        raise ValueError(f"expected 10-digit YYYYMMDD00, got {value!r}")
+    # The trailing 00 is the "daily" in a daily timestamp, and checking only for
+    # ten digits let an hourly stamp through: 2026031012 parsed as 10 March and
+    # loaded as that day's total when it is one hour of it. `one_row_per_date`
+    # would catch a second hour for the same day, but the first one arrives
+    # looking exactly like a legitimate daily figure.
+    if not re.fullmatch(r"\d{8}00", text):
+        raise ValueError(f"expected Wikimedia daily timestamp YYYYMMDD00, got {value!r}")
     return datetime.strptime(text[:8], "%Y%m%d").date()
 
 

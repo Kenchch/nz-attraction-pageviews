@@ -22,7 +22,7 @@ pip install -r requirements.txt
 
 python demo.py                     # offline, synthetic API, no network needed
 python -m nz_attraction_pageviews  # live, hits the Wikimedia API
-pytest -q                          # 122 tests, all offline
+pytest -q                          # 153 tests, all offline
 ```
 
 `demo.py` output:
@@ -262,7 +262,7 @@ Applied per row, in this order:
 
 ## Testing
 
-122 tests, no network. The HTTP call is injected into `fetch_window` and the
+153 tests, no network. The HTTP call is injected into `fetch_window` and the
 fetcher is injected into `ingest.run`, so the suite drives real code paths with
 stubbed transport rather than mocking out the logic being tested.
 

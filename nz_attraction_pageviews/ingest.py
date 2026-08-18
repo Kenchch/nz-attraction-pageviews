@@ -309,7 +309,13 @@ def run(
             raise ValueError(f"{name} must be an integer >= 1, got {value!r}")
     if not isinstance(max_reject_rate, (int, float)) or isinstance(max_reject_rate, bool):
         raise ValueError(f"max_reject_rate must be a number, got {max_reject_rate!r}")
-    if not math.isfinite(max_reject_rate) or not 0.0 <= max_reject_rate <= 1.0:
+    # Range first, isfinite second. math.isfinite converts its argument to a
+    # float, so 10**1000 raised OverflowError out of the validator that exists
+    # to give a clean rejection. The range test handles an int of any size, and
+    # nan fails it too, since every comparison against nan is False.
+    if not 0.0 <= max_reject_rate <= 1.0 or (
+        isinstance(max_reject_rate, float) and not math.isfinite(max_reject_rate)
+    ):
         raise ValueError(
             f"max_reject_rate must be a finite fraction in [0, 1], got {max_reject_rate!r}. "
             f"nan in particular disables the gate silently: every comparison against it "

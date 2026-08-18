@@ -118,9 +118,15 @@ def _backoff_seconds(attempt: int, headers: dict[str, str]) -> float:
 
 def _parse(body: bytes, article: str) -> list[dict]:
     try:
-        payload = json.loads(body)
-    except json.JSONDecodeError as exc:
-        raise SchemaDriftError(f"{article}: body is not JSON ({exc})") from exc
+        # Decoded explicitly. json.loads on bytes sniffs the encoding and copes
+        # with a leading BOM, so a BOM-like prefix surfaced as a
+        # JSONDecodeError and looked handled - but invalid bytes anywhere else
+        # raised a bare UnicodeDecodeError out of this function, naming neither
+        # the article nor the contract. Two of three malformed bodies tested
+        # took that path.
+        payload = json.loads(body.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise SchemaDriftError(f"{article}: body is not valid UTF-8 JSON ({exc})") from exc
 
     if not isinstance(payload, dict):
         # payload.get() on a list or a string raises AttributeError from inside
