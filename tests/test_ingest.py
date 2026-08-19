@@ -1023,3 +1023,27 @@ def test_an_unusable_interval_is_refused(name, value):
     """backfill_days=0 asks for an empty range and looks like a quiet venue."""
     with pytest.raises(ValueError, match=name):
         ingest.run(None, [], **{name: value})
+
+
+def test_a_request_that_raises_is_still_counted(con):
+    """`requests` was incremented after the fetch returned, so the request that
+    raised was never counted.
+
+    The failure path writes this same summary to run_log, which makes the one
+    run whose request count matters the one that reads short: a venue that
+    failed on its very first window logged `requests 0` while having gone to
+    the network. The field answers "how many windows did we ask for", and that
+    is decided when we ask.
+    """
+
+    def explodes(article, start, end):
+        raise client.ApiError("upstream is down")
+
+    with pytest.raises(client.ApiError):
+        ingest.run(con, VENUES, today=TODAY, backfill_days=5, chunk_days=30, fetch=explodes)
+
+    status, requests = con.execute(
+        "SELECT status, requests FROM run_log ORDER BY started_at DESC LIMIT 1"
+    ).fetchone()
+    assert status == "failed"
+    assert requests == 1, "the request that raised was not counted"

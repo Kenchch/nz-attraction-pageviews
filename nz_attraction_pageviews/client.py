@@ -139,7 +139,14 @@ def _backoff_seconds(attempt: int, headers: dict[str, str]) -> float:
     readily as `30`, so it is taken as a request rather than an instruction.
     A header we cannot make sense of falls through to our own backoff.
     """
-    retry_after = headers.get("Retry-After") or headers.get("retry-after")
+    # HTTP header names are case-insensitive (RFC 9110 5.1) and this dict is
+    # whatever the caller built - the real client passes dict(response.headers),
+    # which preserves the server's casing verbatim. Checking two spellings
+    # covered the two we happened to have seen; a proxy sending RETRY-AFTER or
+    # Retry-after fell through to our own backoff, silently ignoring the delay
+    # the server asked for. Fold the case once instead of guessing spellings.
+    folded = {k.lower(): v for k, v in headers.items()}
+    retry_after = folded.get("retry-after")
     if retry_after:
         try:
             requested = float(retry_after)

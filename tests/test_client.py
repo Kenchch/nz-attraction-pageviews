@@ -740,3 +740,14 @@ def test_the_error_body_is_bounded_too():
     exc = urllib.error.HTTPError("u", 500, "boom", {}, _Stream(big))
     with pytest.raises(client.ApiError, match="exceeds"):
         client._read_bounded(exc, "u")
+
+
+@pytest.mark.parametrize(
+    "spelling", ["Retry-After", "retry-after", "RETRY-AFTER", "Retry-after", "retry-After"]
+)
+def test_retry_after_is_found_whatever_the_server_capitalised_it_as(spelling):
+    """HTTP header names are case-insensitive (RFC 9110 5.1), and this dict is
+    dict(response.headers) - the server's casing, verbatim. Two spellings were
+    checked by hand, so a proxy sending any other one fell through to our own
+    backoff and the delay the server asked for was silently ignored."""
+    assert client._backoff_seconds(1, {spelling: "30"}) == 30.0
