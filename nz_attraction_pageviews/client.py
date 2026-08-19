@@ -52,6 +52,21 @@ TRANSPORT_STATUS = 599  # our own marker for "the socket died", not an HTTP code
 # move, so the days are re-asked for tomorrow rather than lost.
 MAX_BACKOFF_SECONDS = 120.0
 
+# Ceiling on how much of a response body we will read into memory.
+#
+# `response.read()` with no argument reads until the server stops sending, and
+# the server is not ours. The largest legitimate body here is one article's
+# daily pageviews for one window: a full year is ~130 bytes per day, about
+# 50 KB, and the ingest never asks for more than a few years at a time. 2 MB is
+# roughly forty years of daily rows - far past anything real, and small enough
+# that a redirected, misconfigured or hostile endpoint streaming an endless
+# body is refused rather than paged into a scheduled job.
+#
+# Refused, not truncated: a truncated JSON body would come back as schema drift
+# or, worse, as a valid prefix, and either would blame the payload for what is
+# actually a transport problem.
+MAX_RESPONSE_BYTES = 2 * 1024 * 1024
+
 # How far back to extend the start date when re-asking a window that answered
 # 404. Observed against the live API: a window can 404 while a wider window
 # ending on the same day returns those exact days. No single pad is reliable
@@ -81,14 +96,33 @@ def build_url(article: str, start: date, end: date) -> str:
     return f"{API_ROOT}/{PROJECT}/{ACCESS}/{AGENT}/{quoted}/daily/{start:%Y%m%d}/{end:%Y%m%d}"
 
 
+def _read_bounded(stream, url: str) -> bytes:
+    """Read at most MAX_RESPONSE_BYTES, and refuse anything longer.
+
+    One extra byte is requested so "exactly at the limit" and "over the limit"
+    are distinguishable; Content-Length is deliberately not trusted, because a
+    body that lies about its length is precisely the case this guards against.
+    """
+    body = stream.read(MAX_RESPONSE_BYTES + 1)
+    if len(body) > MAX_RESPONSE_BYTES:
+        raise ApiError(
+            f"{url}: response exceeds {MAX_RESPONSE_BYTES:,} bytes. The largest "
+            f"real body here is a few tens of KB, so this is a wrong endpoint "
+            f"or a broken one, not data."
+        )
+    return body
+
+
 def http_get(url: str) -> tuple[int, dict[str, str], bytes]:
     """Real network call. Swapped out in tests."""
     request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
     try:
         with urllib.request.urlopen(request, timeout=30) as response:
-            return response.status, dict(response.headers), response.read()
+            return response.status, dict(response.headers), _read_bounded(response, url)
     except urllib.error.HTTPError as exc:
-        return exc.code, dict(exc.headers or {}), exc.read()
+        # The error body is read too - it is the same unbounded socket, and an
+        # endpoint returning 500 with an endless body is if anything likelier.
+        return exc.code, dict(exc.headers or {}), _read_bounded(exc, url)
     except (urllib.error.URLError, TimeoutError, OSError):
         return TRANSPORT_STATUS, {}, b""
 

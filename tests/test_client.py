@@ -691,3 +691,52 @@ def test_a_body_that_is_not_utf8_json_is_named_drift(body):
     the article nor the contract."""
     with pytest.raises(client.SchemaDriftError, match="UTF-8 JSON"):
         client._parse(body, "Te_Papa")
+
+
+class _Stream:
+    """Minimal stand-in for the object urlopen yields: read(n) honours n."""
+
+    def __init__(self, body: bytes):
+        self.body = body
+        self.asked = None
+
+    def read(self, n: int | None = None) -> bytes:
+        self.asked = n
+        return self.body if n is None else self.body[:n]
+
+
+@pytest.mark.parametrize("n", [0, 1024, client.MAX_RESPONSE_BYTES])
+def test_a_body_up_to_the_limit_is_read_whole(n):
+    """The ceiling has to be a ceiling, not a truncation point. Exactly at the
+    limit is still a legitimate body and must come back byte for byte."""
+    stream = _Stream(b"x" * n)
+    assert client._read_bounded(stream, "u") == b"x" * n
+
+
+def test_a_body_over_the_limit_is_refused_rather_than_truncated():
+    """`response.read()` with no argument reads until the server stops sending,
+    and the server is not ours: a redirected, misconfigured or hostile endpoint
+    streaming an endless body would be paged into a scheduled job. One byte
+    over is enough to prove the boundary is where it claims to be.
+
+    Refused, not truncated - a truncated JSON body comes back as schema drift,
+    or worse as a valid prefix, and both blame the payload for a transport
+    problem.
+    """
+    stream = _Stream(b"x" * (client.MAX_RESPONSE_BYTES + 1))
+    with pytest.raises(client.ApiError, match="exceeds"):
+        client._read_bounded(stream, "https://example.invalid/big")
+    # One byte more than the limit is requested, so "at" and "over" differ.
+    assert stream.asked == client.MAX_RESPONSE_BYTES + 1
+
+
+def test_the_error_body_is_bounded_too():
+    """HTTPError is itself a readable stream on the same socket, and an endpoint
+    answering 500 with an endless body is if anything likelier than one doing it
+    on the happy path."""
+    import urllib.error
+
+    big = b"x" * (client.MAX_RESPONSE_BYTES + 1)
+    exc = urllib.error.HTTPError("u", 500, "boom", {}, _Stream(big))
+    with pytest.raises(client.ApiError, match="exceeds"):
+        client._read_bounded(exc, "u")
