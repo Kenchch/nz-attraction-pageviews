@@ -353,8 +353,15 @@ def run(
             venue_bad: list[quality.BadRow] = []
 
             for window_start, window_end in plan_windows(start, end, chunk_days):
-                items = fetch(venue.wiki_article, window_start, window_end)
+                # Counted BEFORE the call. The failure path writes this summary
+                # to the run log, and incrementing afterwards meant the request
+                # that raised was never counted - so the one run whose request
+                # count matters read one short, and a venue that failed on its
+                # first window logged `requests 0` while having gone to the
+                # network. The field answers "how many windows did we ask for",
+                # which is decided when we ask, not when we get an answer.
                 summary.requests += 1
+                items = fetch(venue.wiki_article, window_start, window_end)
                 summary.rows_fetched += len(items)
 
                 good, rejected = quality.check_window(
