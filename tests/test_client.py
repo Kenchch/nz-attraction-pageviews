@@ -694,15 +694,23 @@ def test_a_body_that_is_not_utf8_json_is_named_drift(body):
 
 
 class _Stream:
-    """Minimal stand-in for the object urlopen yields: read(n) honours n."""
+    """Minimal stand-in for the object urlopen yields.
+
+    read(n) honours n, and close() is recorded - a response that is never
+    closed is a socket held until the garbage collector gets to it.
+    """
 
     def __init__(self, body: bytes):
         self.body = body
         self.asked = None
+        self.closed = False
 
     def read(self, n: int | None = None) -> bytes:
         self.asked = n
         return self.body if n is None else self.body[:n]
+
+    def close(self) -> None:
+        self.closed = True
 
 
 @pytest.mark.parametrize("n", [0, 1024, client.MAX_RESPONSE_BYTES])
@@ -730,16 +738,41 @@ def test_a_body_over_the_limit_is_refused_rather_than_truncated():
     assert stream.asked == client.MAX_RESPONSE_BYTES + 1
 
 
-def test_the_error_body_is_bounded_too():
-    """HTTPError is itself a readable stream on the same socket, and an endpoint
-    answering 500 with an endless body is if anything likelier than one doing it
-    on the happy path."""
-    import urllib.error
+@pytest.mark.parametrize("size", [16, client.MAX_RESPONSE_BYTES + 1])
+def test_an_error_response_is_bounded_and_closed(monkeypatch, size):
+    """HTTPError IS the response - same socket, same unbounded read - and it was
+    only ever released by the garbage collector.
 
-    big = b"x" * (client.MAX_RESPONSE_BYTES + 1)
-    exc = urllib.error.HTTPError("u", 500, "boom", {}, _Stream(big))
-    with pytest.raises(client.ApiError, match="exceeds"):
-        client._read_bounded(exc, "u")
+    That is not deterministic even on CPython: raising ApiError out of
+    _read_bounded puts the frame holding `exc` into a traceback, so the socket
+    outlives the call for as long as the exception is being handled. CI saw it
+    on every Python version as a PytestUnraisableExceptionWarning.
+
+    Driven through http_get with urlopen patched, rather than by calling
+    _read_bounded directly, because it is http_get's handling of the error
+    response that is under test. Both sizes must close: the one that returns
+    normally and the one that raises.
+    """
+    import urllib.error
+    import urllib.request
+
+    stream = _Stream(b"x" * size)
+    exc = urllib.error.HTTPError("u", 500, "boom", {"Retry-After": "1"}, stream)
+
+    def boom(request, timeout=None):
+        raise exc
+
+    monkeypatch.setattr(urllib.request, "urlopen", boom)
+
+    if size > client.MAX_RESPONSE_BYTES:
+        with pytest.raises(client.ApiError, match="exceeds"):
+            client.http_get("https://example.invalid/x")
+    else:
+        status, headers, body = client.http_get("https://example.invalid/x")
+        assert (status, body) == (500, b"x" * size)
+        assert headers["Retry-After"] == "1"
+
+    assert stream.closed, "the error response was left for the garbage collector"
 
 
 @pytest.mark.parametrize(

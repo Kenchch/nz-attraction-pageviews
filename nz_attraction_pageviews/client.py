@@ -120,9 +120,19 @@ def http_get(url: str) -> tuple[int, dict[str, str], bytes]:
         with urllib.request.urlopen(request, timeout=30) as response:
             return response.status, dict(response.headers), _read_bounded(response, url)
     except urllib.error.HTTPError as exc:
-        # The error body is read too - it is the same unbounded socket, and an
-        # endpoint returning 500 with an endless body is if anything likelier.
-        return exc.code, dict(exc.headers or {}), _read_bounded(exc, url)
+        # `with exc:` - an HTTPError IS the response, holding the same socket,
+        # and it was only ever closed by the garbage collector. That is not
+        # deterministic even on CPython: raising ApiError from _read_bounded
+        # puts the frame holding `exc` in a traceback, so the socket outlives
+        # the call by however long the exception is handled. pytest saw it as
+        # a PytestUnraisableExceptionWarning on every Python version in CI -
+        # a real descriptor leak surfacing as a test warning.
+        #
+        # The body is read for the same reason the success path is bounded: it
+        # is the same socket, and an endpoint answering 500 with an endless
+        # body is if anything likelier.
+        with exc:
+            return exc.code, dict(exc.headers or {}), _read_bounded(exc, url)
     except (urllib.error.URLError, TimeoutError, OSError):
         return TRANSPORT_STATUS, {}, b""
 
