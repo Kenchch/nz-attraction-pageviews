@@ -1047,3 +1047,29 @@ def test_a_request_that_raises_is_still_counted(con):
     ).fetchone()
     assert status == "failed"
     assert requests == 1, "the request that raised was not counted"
+
+
+@pytest.mark.parametrize("cancellation", [KeyboardInterrupt, SystemExit])
+def test_cancelling_mid_write_still_rolls_back(con, monkeypatch, cancellation):
+    """Ctrl-C is exactly when a half-written transaction is likeliest.
+
+    The cleanup caught Exception, which neither KeyboardInterrupt nor
+    SystemExit inherits from, so both went past without a ROLLBACK and left the
+    connection open mid-write - with the pageviews rows already inserted and
+    the run log not yet written.
+    """
+    rows_before = con.execute("SELECT count(*) FROM pageviews").fetchone()[0]
+
+    def cancel(*a, **k):
+        raise cancellation("user pressed Ctrl-C")
+
+    monkeypatch.setattr(ingest, "_write_run_log", cancel)
+
+    with pytest.raises(cancellation):
+        ingest.run(con, VENUES, today=TODAY, backfill_days=5, chunk_days=30, fetch=Recorder())
+
+    # The connection is usable and holds no partial write: a still-open
+    # transaction would make this count include the abandoned inserts.
+    assert con.execute("SELECT count(*) FROM pageviews").fetchone()[0] == rows_before
+    con.execute("BEGIN TRANSACTION")
+    con.execute("ROLLBACK")

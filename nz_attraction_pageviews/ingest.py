@@ -524,12 +524,21 @@ def _load(con, run_id, clean, bad, new_watermarks, summary, started_at) -> None:
             )
         _write_run_log(con, summary, started_at)
         con.execute("COMMIT")
-    except Exception:
+    except BaseException:
+        # BaseException, not Exception: Ctrl-C and SystemExit are precisely when
+        # a half-written transaction is likeliest, and `except Exception` let
+        # both past without a ROLLBACK, leaving the connection open mid-write.
+        #
+        # This is the innermost cleanup and it re-raises, so cancellation still
+        # propagates unchanged. The run-level handler above stays on Exception
+        # on purpose - a user pressing Ctrl-C should not be written into
+        # run_log as an ordinary failure.
+        #
         # Guarded: a ROLLBACK that itself fails (the BEGIN never took, say) must
         # not replace the error that explains what actually went wrong.
         try:
             con.execute("ROLLBACK")
-        except Exception:
+        except BaseException:
             pass
         raise
 
