@@ -22,7 +22,7 @@ pip install -r requirements.txt
 
 python demo.py                     # offline, synthetic API, no network needed
 python -m nz_attraction_pageviews  # live, hits the Wikimedia API
-pytest -q                          # 171 tests, all offline
+pytest -q                          # 180 tests, all offline
 ```
 
 `demo.py` output:
@@ -201,12 +201,32 @@ would neither recover the day nor stop happening. The cost of all this is that
 every venue re-asks for its last few days each night.
 
 **5. The gate runs before the load, not after.**
-If more than 5% of a run is rejected, nothing is written and last night's data
-stays intact. A partial load is worse than no load, because a partial load still
-renders on a dashboard and looks fine. The gate is deliberately a whole-run rate
-rather than a per-venue one: at eight venues on a daily schedule a per-venue rate
-is one or two rows, where a single bad row reads as 100% and would abort the run
-for everyone. Decision 4 is what makes that safe — the run continues, but no
+If more than 5% of a run is *newly* rejected, nothing is written and last
+night's data stays intact. A partial load is worse than no load, because a
+partial load still renders on a dashboard and looks fine.
+
+Two words there carry the weight, and both were learned the hard way.
+
+*Newly.* A day already sitting in `quarantine` for the same rule cannot be lost
+a second time — decision 4 is already holding the watermark short of it. Counted
+again every night, it pins the rate at a value nothing dilutes.
+
+*Per venue, then globally.* The gate was a single whole-run rate, on the
+reasoning that at eight venues a per-venue rate is one or two rows and a single
+bad row reads as 100%. But a whole-run rate is **scale-invariant to a whole
+venue failing**: one venue of eight rejecting everything is 1/8 = 12.5% against
+a 5% ceiling, whatever the range length and however many venues are added.
+Measured with one venue whose title had drifted so the API answered 200 with a
+different article, the gate tripped every night, nothing loaded, no watermark
+moved, and the seven healthy venues stored **zero rows** — indefinitely. Once
+the oldest held day passed `max_lookback_days`, all eight would have given up on
+it together. One silent redirect upstream cost the whole warehouse.
+
+So a venue whose own *newly* rejected share is over the ceiling is **held**: its
+rows are quarantined, its watermark stays put, it is named in `run_log.note`,
+and it gets no vote in "is tonight's extract broadly bad". If every venue is
+held, that is a bad extract and the gate says so rather than passing on an empty
+numerator. Decision 4 is what makes all of it safe — the run continues, but no
 venue advances past a day it did not load.
 
 **6. The load is one transaction, and re-running is free.**
@@ -269,7 +289,7 @@ Applied per row, in this order:
 
 ## Testing
 
-171 tests, no network. The HTTP call is injected into `fetch_window` and the
+180 tests, no network. The HTTP call is injected into `fetch_window` and the
 fetcher is injected into `ingest.run`, so the suite drives real code paths with
 stubbed transport rather than mocking out the logic being tested.
 

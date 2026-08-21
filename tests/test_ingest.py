@@ -1065,7 +1065,10 @@ def test_a_venue_falling_behind_is_named_in_the_note(con):
     )
 
     assert "milford-sound" in summary.note
-    assert "days behind" in summary.note
+    # Measured from the last day the venue actually produced, not from its
+    # watermark - which walks the trust line on other venues' evidence and so
+    # can never be more than trust_lag_days behind `end`.
+    assert "no rows for" in summary.note
     assert ingest.get_watermark(con, "milford-sound") == end, "and it is holding, not losing"
 
 
@@ -1221,3 +1224,216 @@ def test_a_venue_whose_rows_are_all_rejected_is_named_in_the_note(con):
         f"a venue rejecting every row is not named in the note: {summary.note!r}"
     )
     assert "rejected" in summary.note
+
+
+EIGHT = [ingest.Venue(f"v{i}", f"Venue {i}", "R", f"Article_{i}") for i in range(8)]
+
+
+def _daily(article, start, end, name=None, views=10):
+    return [
+        {
+            "project": "en.wikipedia",
+            "article": name or article,
+            "granularity": "daily",
+            "timestamp": f"{d:%Y%m%d}00",
+            "access": "all-access",
+            "agent": "user",
+            "views": views,
+        }
+        for d in (start + timedelta(days=n) for n in range((end - start).days + 1))
+    ]
+
+
+def test_one_broken_venue_does_not_deadlock_the_other_seven(con):
+    """The global reject-rate gate was scale-invariant to a whole venue failing.
+
+    One venue of eight rejecting everything pins the rate at 1/8 = 12.5%
+    against a 5% ceiling - however long the range, however many venues there
+    are. Growth does not dilute it. So the gate tripped every night, nothing
+    loaded, no watermark moved, every venue re-fetched the same window forever,
+    and once the oldest held day fell past max_lookback_days all eight gave up
+    on it together. One silent redirect upstream cost the whole warehouse.
+
+    Measured before the fix:
+
+        night 0: GATE TRIPPED rate=0.125
+        night 1: GATE TRIPPED rate=0.125   ... indefinitely
+        rows stored for the SEVEN HEALTHY venues : 0
+
+    Gating on NOVEL rejections alone does not fix this - `quarantine` is
+    written by _load, which runs after the gate, so a venue that breaks all at
+    once persists nothing and every night looks like the first. A venue over
+    the ceiling on its OWN rows is held instead: quarantined, watermark held,
+    named in the note, and no vote in "is tonight's extract broadly bad".
+    """
+
+    def drifted(article, start, end):
+        if article == "Article_0":
+            return _daily(article, start, end, name="Some_Other_Page")
+        return _daily(article, start, end)
+
+    for night in range(3):
+        summary = ingest.run(
+            con,
+            EIGHT,
+            today=TODAY + timedelta(days=night),
+            backfill_days=10,
+            chunk_days=30,
+            fetch=drifted,
+        )
+        assert summary.status == "ok", f"night {night} deadlocked"
+
+    healthy = con.execute("SELECT count(*) FROM pageviews WHERE venue_id != 'v0'").fetchone()[0]
+    assert healthy > 0, "the seven healthy venues never loaded"
+    assert con.execute("SELECT count(*) FROM watermark").fetchone()[0] == 7
+    assert "v0" in summary.note
+    assert ingest.get_watermark(con, "v0") is None, "the broken venue advanced"
+
+
+def test_every_venue_rejecting_is_still_a_failed_extract(con):
+    """Holding one venue is right; holding all eight is a bad extract, and the
+    gate has to say so rather than passing on an empty numerator."""
+
+    def all_wrong(article, start, end):
+        return _daily(article, start, end, name="Some_Other_Page")
+
+    with pytest.raises(quality.QualityGateFailed, match="bad extract"):
+        ingest.run(con, EIGHT, today=TODAY, backfill_days=10, chunk_days=30, fetch=all_wrong)
+
+
+def test_a_day_already_quarantined_is_not_counted_against_the_gate_again(con):
+    """A day in `quarantine` for the same rule cannot be lost twice - the
+    watermark is already holding short of it. Re-counting it every night is
+    what turns a standing problem into a stoppage."""
+    bad_day = TODAY - timedelta(days=ingest.PUBLICATION_LAG_DAYS)
+
+    def one_bad_day(article, start, end):
+        rows = _daily(article, start, end)
+        for row in rows:
+            if row["timestamp"].startswith(f"{bad_day:%Y%m%d}"):
+                row["views"] = -1  # rejected by a value rule
+        return rows
+
+    # A 40-day window, so one bad day is 2.5% - under the ceiling, so the venue
+    # stays in the run rather than being held.
+    first = ingest.run(con, VENUES, today=TODAY, backfill_days=40, chunk_days=60, fetch=one_bad_day)
+    assert first.rows_quarantined > 0
+
+    second = ingest.run(
+        con, VENUES, today=TODAY, backfill_days=40, chunk_days=60, fetch=one_bad_day
+    )
+    assert second.status == "ok"
+    assert "already quarantined" in second.note
+
+
+def test_a_renamed_article_is_named_even_though_its_watermark_advances(con):
+    """The watermark walks the trust line on OTHER venues' evidence.
+
+    Publication is a property of the API, so a healthy sibling pushes a dead
+    venue's watermark forward night after night. It therefore sits at exactly
+    `trust_lag_days - PUBLICATION_LAG_DAYS` behind `end` and can never satisfy
+    a `> trust_lag_days` test - the alert built to catch a renamed or deleted
+    article was structurally unable to fire, while the watermark quietly
+    skipped the days.
+    """
+
+    def one_goes_dark(article, start, end):
+        if article == "Article_0":
+            return []
+        return _daily(article, start, end)
+
+    # A first healthy night so every venue has history, then the article dies.
+    ingest.run(
+        con,
+        EIGHT,
+        today=TODAY,
+        backfill_days=10,
+        chunk_days=30,
+        fetch=lambda a, s, e: _daily(a, s, e),
+    )
+    summary = None
+    for night in range(1, ingest.TRUST_LAG_DAYS + 6):
+        summary = ingest.run(
+            con,
+            EIGHT,
+            today=TODAY + timedelta(days=night),
+            backfill_days=10,
+            chunk_days=30,
+            fetch=one_goes_dark,
+        )
+
+    assert "v0" in summary.note, f"the dead venue is not named: {summary.note!r}"
+    assert "no rows for" in summary.note
+
+
+def test_fixing_a_typo_in_venues_csv_recovers_the_history(con):
+    """A misspelt title consumed the whole backfill window on the first run.
+
+    The watermark walks the trust line on OTHER venues' evidence - publication
+    is a property of the API - so a healthy sibling pushes a dead venue's
+    watermark forward night after night. read_venues deliberately keeps
+    venue_id stable when the title is corrected, so the corrected article
+    resumed from the advanced watermark and its history was never asked for
+    again. Nothing told the operator that fixing a typo needed a manual
+    watermark delete.
+
+    While a venue has never produced a row, its watermark is not a record of
+    coverage, so the whole window keeps being requested. The moment it produces
+    one, this stops.
+    """
+
+    def typo(article, start, end):
+        if article == "Article_0":
+            return []  # the misspelt title 404s
+        return _daily(article, start, end)
+
+    for night in range(3):
+        ingest.run(
+            con,
+            EIGHT,
+            today=TODAY + timedelta(days=night),
+            backfill_days=20,
+            chunk_days=30,
+            fetch=typo,
+        )
+
+    advanced = ingest.get_watermark(con, "v0")
+    assert advanced is not None, "the fixture no longer demonstrates the problem"
+
+    # The operator corrects venues.csv. venue_id is unchanged by design.
+    ingest.run(
+        con,
+        EIGHT,
+        today=TODAY + timedelta(days=3),
+        backfill_days=20,
+        chunk_days=30,
+        fetch=lambda a, s, e: _daily(a, s, e),
+    )
+
+    days = con.execute(
+        "SELECT count(DISTINCT view_date) FROM pageviews WHERE venue_id = 'v0'"
+    ).fetchone()[0]
+    # The whole backfill window, not just the days since the watermark had
+    # walked to. Without the fix this is a handful of days and the rest of the
+    # history is gone for good.
+    assert days == 20, f"the corrected venue recovered only {days} of 20 days"
+
+
+def test_a_venue_with_rows_resumes_from_its_watermark(con):
+    """The other half: once a venue has produced something, its watermark IS a
+    record of coverage and the whole window must not be re-requested."""
+    ingest.run(
+        con,
+        VENUES,
+        today=TODAY,
+        backfill_days=10,
+        chunk_days=30,
+        fetch=lambda a, s, e: _daily(a, s, e),
+    )
+    watermark = ingest.get_watermark(con, "milford-sound")
+    assert watermark is not None
+
+    start = ingest.start_date_for(
+        con, VENUES[0], TODAY - timedelta(days=ingest.PUBLICATION_LAG_DAYS), 10
+    )
+    assert start == watermark + timedelta(days=1)

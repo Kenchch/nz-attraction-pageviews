@@ -16,6 +16,7 @@ the other five.
 
 from __future__ import annotations
 
+import collections
 import csv
 import math
 import uuid
@@ -248,8 +249,22 @@ def get_watermark(con, venue_id: str) -> date | None:
 def start_date_for(con, venue: Venue, end: date, backfill_days: int) -> date:
     """Resume the day after the watermark, or backfill on first sight of a venue."""
     watermark = get_watermark(con, venue.venue_id)
+    backfill = end - timedelta(days=backfill_days - 1)
     if watermark is None:
-        return end - timedelta(days=backfill_days - 1)
+        return backfill
+    if not _has_any_rows(con, venue.venue_id):
+        # A watermark that has only ever walked on the trust line, for a venue
+        # that has never produced a row, is not a record of coverage - it is
+        # the OTHER venues' evidence wearing this venue's name. The frontier is
+        # a property of the API, so a healthy sibling pushes this venue's
+        # watermark forward night after night while its own article 404s.
+        #
+        # A typo in venues.csv therefore consumed the whole backfill window on
+        # the first run, and read_venues keeps venue_id stable when the title
+        # is corrected, so fixing the typo recovered only the days since. Keep
+        # asking for the whole window until the venue produces something; the
+        # moment it does, this stops.
+        return min(watermark + timedelta(days=1), backfill)
     return watermark + timedelta(days=1)
 
 
@@ -476,26 +491,138 @@ def run(
             # too. A venue whose article title resolves to a DIFFERENT article
             # - the realistic hazard, since the API is title-exact and
             # redirects are silent - lands exactly there: every row fails
-            # article_matches_request, seven healthy venues dilute the reject
-            # rate below the gate, the run reports `ok`, and the note is empty.
-            # It re-fetches and re-quarantines the same window every night
-            # forever. The test is now "has this venue ever loaded a row",
-            # which is the question the alert was always asking.
+            # article_matches_request and the note was empty, so the only
+            # signal was the gate - which does not report a venue, it stops the
+            # pipeline. (An earlier version of this comment claimed the healthy
+            # venues "dilute the reject rate below the gate". They do not:
+            # one venue of eight is 12.5% against a 5% ceiling.) The test is
+            # now "has this venue ever loaded a row", which is the question the
+            # alert was always asking.
             effective = new_watermarks.get(venue.venue_id, current)
             if not _has_any_rows(con, venue.venue_id) and not venue_clean:
                 detail = f", {len(venue_bad)} row(s) rejected" if venue_bad else ""
                 silent.append(
                     f"{venue.venue_id}: no rows ever{detail}, check {venue.wiki_article!r}"
                 )
-            elif effective is not None and (end - effective).days > trust_lag_days:
-                silent.append(f"{venue.venue_id}: {(end - effective).days} days behind")
+            else:
+                # Measured from the last day this venue actually PRODUCED, not
+                # from its watermark. The watermark walks the trust line on
+                # other venues' evidence whether or not this article is still
+                # being served, so it sits at exactly
+                # `trust_lag_days - PUBLICATION_LAG_DAYS` behind `end` and can
+                # never satisfy `> trust_lag_days`. An article renamed or
+                # deleted upstream was therefore skipped day after day by a
+                # watermark that was, in this scenario, the thing telling the
+                # lie - and the alert built to catch it could not fire.
+                last = con.execute(
+                    "SELECT max(view_date) FROM pageviews WHERE venue_id = ?",
+                    [venue.venue_id],
+                ).fetchone()[0]
+                if venue_clean:
+                    newest = max(r.view_date for r in venue_clean)
+                    last = newest if last is None else max(last, newest)
+                if last is not None and (end - last).days > trust_lag_days:
+                    silent.append(
+                        f"{venue.venue_id}: no rows for {(end - last).days} days "
+                        f"(watermark {effective}), check {venue.wiki_article!r}"
+                    )
 
         summary.rows_quarantined = len(bad)
         # Record the rate before the gate can raise, so a failed run logs the
         # number that explains why it failed rather than 0.0.
         summary.reject_rate = quality.reject_rate(summary.rows_fetched, summary.rows_quarantined)
+
+        # The gate fires on what is NEW.
+        #
+        # A day already sitting in `quarantine` for the same rule cannot be
+        # lost a second time - _venue_watermark is already holding the
+        # watermark short of it, which is the whole mechanism by which nothing
+        # is lost. Counting it again every night turns one broken venue into a
+        # permanent stoppage of the entire pipeline, and the rate it pins is
+        # scale-invariant: one venue of eight rejecting everything gives
+        # 1/8 = 12.5% however long the range or however many venues there are.
+        # Growth does not dilute it; adding venues does not dilute it.
+        #
+        # Measured, with one venue whose title had drifted so the API answered
+        # 200 with a different article:
+        #
+        #   night 0: GATE TRIPPED rate=0.125
+        #   night 1: GATE TRIPPED rate=0.125
+        #   ... every night, indefinitely
+        #   rows stored for the SEVEN HEALTHY venues : 0
+        #
+        # Nothing loads, so no watermark moves, so every venue re-fetches the
+        # same window forever - and once the oldest held day falls past
+        # max_lookback_days, all eight venues give up on it together. A single
+        # silent redirect upstream costs the whole warehouse.
+        #
+        # The gate exists to stop a bad EXTRACT reaching the warehouse. A day
+        # that has already been quarantined is not part of this extract's
+        # verdict; it is a standing problem, and `run_log.note` is what reports
+        # a standing problem.
+        already = {
+            (r[0], r[1], r[2])
+            for r in con.execute("SELECT venue_id, view_date, rule FROM quarantine").fetchall()
+        }
+        novel = [r for r in bad if (r.venue_id, r.view_date, r.rule) not in already]
+
+        if len(novel) != len(bad):
+            # Otherwise the log shows a rate above the ceiling on a run that
+            # passed, and nothing says why.
+            silent.append(
+                f"{len(bad) - len(novel)} of {len(bad)} rejected rows were "
+                f"already quarantined; gate saw {len(novel)}"
+            )
+
+        # ... and it fires per VENUE before it fires globally.
+        #
+        # Novel-only is necessary but not sufficient on its own: `quarantine`
+        # is written by _load, which runs AFTER this, so a venue that breaks
+        # all at once persists nothing, `already` stays empty, and every night
+        # looks like the first. A venue whose NOVEL rejection rate is over the
+        # ceiling is broken on its own terms and does not get a vote in "is
+        # tonight's extract broadly bad". Its rows are still quarantined, its
+        # watermark is still held short of them by _venue_watermark, and it is
+        # named in the note. What changes is that it can no longer stop the
+        # other seven venues from loading.
+        #
+        # Novel, not raw, for the per-venue test too. A venue stuck re-fetching
+        # one known-bad day is 100% rejected every night on a window of one -
+        # so a raw test would hold it forever, and if every venue is stuck on
+        # its own bad day it would hold all of them and deadlock exactly as
+        # before. Nothing is NEWLY wrong with such a venue; the standing
+        # problem is what run_log.note reports.
+        novel_by_venue = collections.Counter(r.venue_id for r in novel)
+        held = set()
+        for venue, _s, venue_clean, venue_bad in fetched:
+            seen = len(venue_clean) + len(venue_bad)
+            fresh = novel_by_venue.get(venue.venue_id, 0)
+            if seen and quality.reject_rate(seen, fresh) > max_reject_rate:
+                held.add(venue.venue_id)
+                silent.append(
+                    f"{venue.venue_id}: {fresh}/{seen} newly rejected, above the ceiling, held"
+                )
+
+        gate_fetched = sum(
+            len(venue_clean) + len(venue_bad)
+            for venue, _s, venue_clean, venue_bad in fetched
+            if venue.venue_id not in held
+        )
+        gate_bad = [r for r in novel if r.venue_id not in held]
+
         summary.note = "; ".join([*stalled, *silent])
-        quality.enforce_gate(summary.rows_fetched, summary.rows_quarantined, max_reject_rate)
+
+        if held and not gate_fetched:
+            # Every venue over the ceiling is not "eight separate problems", it
+            # is a bad extract, and the gate has to say so rather than passing
+            # vacuously on an empty numerator. Guarded on `held` rather than on
+            # `fetched`: a run where every venue legitimately returned NO rows
+            # also leaves gate_fetched at 0, and that is a quiet night.
+            raise quality.QualityGateFailed(
+                f"every venue rejected above the {max_reject_rate:.0%} ceiling "
+                f"- this is a bad extract, not {len(held)} bad venues."
+            )
+        quality.enforce_gate(gate_fetched, len(gate_bad), max_reject_rate)
 
         # Set before the load, because the load is what writes the run log now.
         summary.rows_loaded = len(clean)

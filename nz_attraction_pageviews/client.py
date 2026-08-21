@@ -18,6 +18,7 @@ The network call is injected (`opener`) so the tests run offline.
 
 from __future__ import annotations
 
+import http.client
 import json
 import math
 import random
@@ -132,8 +133,25 @@ def http_get(url: str) -> tuple[int, dict[str, str], bytes]:
         # is the same socket, and an endpoint answering 500 with an endless
         # body is if anything likelier.
         with exc:
-            return exc.code, dict(exc.headers or {}), _read_bounded(exc, url)
-    except (urllib.error.URLError, TimeoutError, OSError):
+            try:
+                body = _read_bounded(exc, url)
+            except (OSError, http.client.HTTPException):
+                # An error body can be truncated mid-read just as a success
+                # body can. That is a transport failure, not a 4xx/5xx worth
+                # reporting as one.
+                return TRANSPORT_STATUS, {}, b""
+            return exc.code, dict(exc.headers or {}), body
+    except (
+        urllib.error.URLError,
+        TimeoutError,
+        OSError,
+        # http.client.HTTPException is NOT an OSError - IncompleteRead, which
+        # is what a truncated chunked response raises, inherits straight from
+        # Exception. So it escaped this handler entirely: one truncated
+        # response killed the whole night's run for all eight venues, with
+        # zero retries, on the one class of failure retries exist for.
+        http.client.HTTPException,
+    ):
         return TRANSPORT_STATUS, {}, b""
 
 
