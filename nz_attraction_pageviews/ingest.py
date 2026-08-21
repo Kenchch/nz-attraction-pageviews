@@ -66,7 +66,7 @@ CREATE TABLE IF NOT EXISTS pageviews (
     view_date   DATE    NOT NULL,
     views       BIGINT  NOT NULL,
     run_id      VARCHAR NOT NULL,
-    loaded_at   TIMESTAMPTZ NOT NULL,
+    loaded_at   TIMESTAMP NOT NULL,  -- UTC
     PRIMARY KEY (venue_id, view_date)
 );
 
@@ -80,19 +80,19 @@ CREATE TABLE IF NOT EXISTS quarantine (
     rule       VARCHAR NOT NULL,
     detail     VARCHAR,
     raw        VARCHAR,
-    seen_at    TIMESTAMPTZ NOT NULL
+    seen_at    TIMESTAMP NOT NULL  -- UTC
 );
 
 CREATE TABLE IF NOT EXISTS watermark (
     venue_id   VARCHAR PRIMARY KEY,
     last_date  DATE NOT NULL,
-    updated_at TIMESTAMPTZ NOT NULL
+    updated_at TIMESTAMP NOT NULL  -- UTC
 );
 
 CREATE TABLE IF NOT EXISTS run_log (
     run_id            VARCHAR PRIMARY KEY,
-    started_at        TIMESTAMPTZ NOT NULL,
-    finished_at       TIMESTAMPTZ,
+    started_at        TIMESTAMP NOT NULL,  -- UTC
+    finished_at       TIMESTAMP,  -- UTC
     status            VARCHAR NOT NULL,
     venues            INTEGER NOT NULL,
     requests          INTEGER NOT NULL,
@@ -109,28 +109,8 @@ CREATE TABLE IF NOT EXISTS run_log (
 # fails on the column count. Adding the column is idempotent, and every insert in
 # this module names its columns, so it does not matter that a migrated column
 # lands at the end rather than in the middle where the DDL above puts it.
-# TIMESTAMP is timezone-NAIVE in DuckDB. Every datetime this module writes is
-# built with datetime.now(UTC), and DuckDB converted each one to the session's
-# local wall time on the way in and dropped the offset: a row loaded at 09:53
-# UTC was stored as 21:53 on an NZST host. So the one set of values that is
-# explicitly UTC by construction was the one set stored in local time, sitting
-# beside a view_date that genuinely is a UTC day. The same file read on a host
-# in another zone reported different absolute times for the same run, and in a
-# DST zone the local clock steps backwards once a year, so `ORDER BY started_at
-# DESC` - the query the README recommends - could return two runs an hour apart
-# in the wrong order.
-#
-# TIMESTAMPTZ stores the instant. The ALTERs are also a correct repair for
-# existing data: DuckDB reads a naive value as local when widening, and local is
-# exactly what those rows were written as, so they round-trip back to the UTC
-# instant they should always have been.
 MIGRATIONS = """
 ALTER TABLE quarantine ADD COLUMN IF NOT EXISTS view_date DATE;
-ALTER TABLE pageviews  ALTER COLUMN loaded_at   SET DATA TYPE TIMESTAMPTZ;
-ALTER TABLE quarantine ALTER COLUMN seen_at     SET DATA TYPE TIMESTAMPTZ;
-ALTER TABLE watermark  ALTER COLUMN updated_at  SET DATA TYPE TIMESTAMPTZ;
-ALTER TABLE run_log    ALTER COLUMN started_at  SET DATA TYPE TIMESTAMPTZ;
-ALTER TABLE run_log    ALTER COLUMN finished_at SET DATA TYPE TIMESTAMPTZ;
 """
 
 
@@ -153,6 +133,30 @@ class RunSummary:
     rows_quarantined: int = 0
     reject_rate: float = 0.0
     note: str = ""
+
+
+def utc_now() -> datetime:
+    """Now, in UTC, with no offset attached - which is what the columns hold.
+
+    DuckDB's TIMESTAMP is timezone-NAIVE. Handing it an aware datetime does not
+    store the offset and does not store UTC: it converts the instant to the
+    SESSION's local wall time and keeps that. So `datetime.now(UTC)` - which
+    every write site used, deliberately - was the one value in the schema
+    guaranteed to be stored in local time, beside a view_date that genuinely is
+    a UTC day. On an NZST host a row loaded at 09:53 UTC read back as 21:53,
+    twelve hours ahead of every date in its own table; the same file read in
+    another zone reported different absolute times for the same run; and in a
+    DST zone the local clock steps back once a year, so `ORDER BY started_at
+    DESC` - the query the README recommends - could order two runs an hour
+    apart backwards.
+
+    Dropping the offset AFTER converting to UTC stores the UTC wall time, which
+    is what the column is documented to hold and what the rest of the schema
+    already assumes. TIMESTAMPTZ would carry the offset properly, but DuckDB
+    needs pytz to read one back, and a timezone bug is not worth a new runtime
+    dependency.
+    """
+    return datetime.now(UTC).replace(tzinfo=None)
 
 
 def connect(db_path: str | Path) -> duckdb.DuckDBPyConnection:
@@ -360,7 +364,7 @@ def run(
     calendar_trust_line = today - timedelta(days=trust_lag_days)
 
     run_id = uuid.uuid4().hex[:12]
-    started_at = datetime.now(UTC)
+    started_at = utc_now()
     summary = RunSummary(run_id=run_id, status="running", venues=len(venues))
 
     clean: list[quality.CleanRow] = []
@@ -553,7 +557,7 @@ def _load(con, run_id, clean, bad, new_watermarks, summary, started_at) -> None:
     quietly disagreeing with `count(*)`. A failed run has no data to disagree
     with, so `run` writes its log separately on that path.
     """
-    now = datetime.now(UTC)
+    now = utc_now()
     try:
         con.execute("BEGIN TRANSACTION")
         if clean:
@@ -609,7 +613,7 @@ def _write_run_log(con, summary: RunSummary, started_at: datetime) -> None:
         [
             summary.run_id,
             started_at,
-            datetime.now(UTC),
+            utc_now(),
             summary.status,
             summary.venues,
             summary.requests,
