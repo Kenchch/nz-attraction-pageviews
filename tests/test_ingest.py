@@ -512,19 +512,92 @@ def test_a_sparse_venue_still_makes_progress(con):
     assert ingest.get_watermark(con, "milford-sound") > first, "a quiet venue must still advance"
 
 
-def test_empty_window_advances_the_watermark_as_far_as_the_trust_line(con):
+def test_a_quiet_venue_advances_to_the_trust_line_once_anything_has_published(con):
     """A genuinely quiet venue must not be re-requested forever - but an empty
     window proves nothing about days too recent to have published yet, so it
-    advances to the trust line rather than all the way to the end."""
+    advances to the trust line rather than all the way to the end.
 
-    def nothing(article, start, end):
-        return []
+    "Quiet" is only readable as quiet when something proves the upstream is
+    publishing. Here the busy venue provides that evidence, so the silent one
+    may advance.
+    """
 
-    ingest.run(con, VENUES, today=TODAY, backfill_days=10, chunk_days=30, fetch=nothing)
+    def only_te_papa(article, start, end):
+        if "Te_Papa" not in article:
+            return []
+        return [
+            {
+                "project": "en.wikipedia",
+                "article": article,
+                "granularity": "daily",
+                "timestamp": f"{d:%Y%m%d}00",
+                "access": "all-access",
+                "agent": "user",
+                "views": 10,
+            }
+            for d in (start + timedelta(days=n) for n in range((end - start).days + 1))
+        ]
+
+    ingest.run(con, VENUES, today=TODAY, backfill_days=10, chunk_days=30, fetch=only_te_papa)
 
     assert ingest.get_watermark(con, "milford-sound") == TODAY - timedelta(
         days=ingest.TRUST_LAG_DAYS
     )
+
+
+def test_nothing_published_anywhere_holds_every_watermark(con):
+    """The escape hatch that cost a whole backfill.
+
+    With an empty warehouse and a run that fetched nothing, `trusted_end` fell
+    back to the bare calendar line - trusting a date with zero evidence that
+    the upstream had published anything. "Quiet" and "the upstream is down"
+    look identical in a response, and an outage keeps the warehouse empty, so
+    every night the run reported `ok` and stepped every watermark forward one
+    day. Measured on a fresh deploy whose first night hit an incident: 84 of
+    the 89 days the API had were skipped permanently.
+
+    With no evidence, hold. The cost is a re-request; the alternative was the
+    data.
+    """
+
+    def nothing(article, start, end):
+        return []
+
+    summary = ingest.run(con, VENUES, today=TODAY, backfill_days=10, chunk_days=30, fetch=nothing)
+
+    assert summary.status == "ok"
+    for venue in VENUES:
+        assert ingest.get_watermark(con, venue.venue_id) is None
+
+
+def test_the_held_backfill_is_recovered_when_the_upstream_returns(con):
+    """The point of holding: the days are still asked for next time."""
+
+    def nothing(article, start, end):
+        return []
+
+    def everything(article, start, end):
+        return [
+            {
+                "project": "en.wikipedia",
+                "article": article,
+                "granularity": "daily",
+                "timestamp": f"{d:%Y%m%d}00",
+                "access": "all-access",
+                "agent": "user",
+                "views": 42,
+            }
+            for d in (start + timedelta(days=n) for n in range((end - start).days + 1))
+        ]
+
+    ingest.run(con, VENUES, today=TODAY, backfill_days=10, chunk_days=30, fetch=nothing)
+    ingest.run(con, VENUES, today=TODAY, backfill_days=10, chunk_days=30, fetch=everything)
+
+    days = con.execute(
+        "SELECT count(DISTINCT view_date) FROM pageviews WHERE venue_id = ?",
+        ["milford-sound"],
+    ).fetchone()[0]
+    assert days == 10, "the held days were not re-requested"
 
 
 def test_quarantine_row_carries_the_day_it_belongs_to(con):
@@ -1073,3 +1146,81 @@ def test_cancelling_mid_write_still_rolls_back(con, monkeypatch, cancellation):
     assert con.execute("SELECT count(*) FROM pageviews").fetchone()[0] == rows_before
     con.execute("BEGIN TRANSACTION")
     con.execute("ROLLBACK")
+
+
+def test_every_timestamp_is_stored_as_an_instant_not_local_wall_time(con):
+    """TIMESTAMP is timezone-NAIVE in DuckDB.
+
+    Every datetime this module writes is built with datetime.now(UTC), and
+    DuckDB converted each one to the session's local wall time on the way in
+    and dropped the offset - so the one set of values that is explicitly UTC by
+    construction was the one set stored in local time, beside a view_date that
+    genuinely is a UTC day. On an NZST host a row loaded at 09:53 UTC read back
+    as 21:53, twelve hours ahead of every date in its own table.
+    """
+    from datetime import datetime, timezone
+
+    before = datetime.now(timezone.utc)
+    ingest.run(con, VENUES, today=TODAY, backfill_days=3, chunk_days=30, fetch=Recorder())
+    after = datetime.now(timezone.utc)
+
+    for table, column in (
+        ("pageviews", "loaded_at"),
+        ("watermark", "updated_at"),
+        ("run_log", "started_at"),
+        ("run_log", "finished_at"),
+    ):
+        value = con.execute(f"SELECT {column} FROM {table} LIMIT 1").fetchone()[0]
+        assert value.tzinfo is not None, f"{table}.{column} lost its offset"
+        assert before <= value <= after, (
+            f"{table}.{column} is {value}, outside the run's own window "
+            f"{before}..{after} - it was stored as local wall time"
+        )
+
+
+def test_a_venue_whose_rows_are_all_rejected_is_named_in_the_note(con):
+    """The two health alerts left a gap between them.
+
+    "no rows ever" required venue_bad to be EMPTY, so a venue returning rows
+    and having all of them rejected was excluded; the "days behind" branch
+    reads a watermark that such a venue has never set, so it was excluded there
+    too. A wiki_article that resolves to a DIFFERENT article lands exactly
+    there - the realistic hazard, since the API is title-exact and redirects
+    are silent. Every row fails article_matches_request, the other venue
+    dilutes the reject rate below the gate, the run reports `ok`, and the note
+    is empty. It re-quarantines the same window every night, forever.
+    """
+
+    def wrong_article(article, start, end):
+        if "Milford" not in article:
+            return Recorder()(article, start, end)
+        # 200 OK, real rows - for somebody else's article.
+        return [
+            {
+                "project": "en.wikipedia",
+                "article": "Some_Other_Page",
+                "granularity": "daily",
+                "timestamp": f"{d:%Y%m%d}00",
+                "access": "all-access",
+                "agent": "user",
+                "views": 5,
+            }
+            for d in (start + timedelta(days=n) for n in range((end - start).days + 1))
+        ]
+
+    summary = ingest.run(
+        con,
+        VENUES,
+        today=TODAY,
+        backfill_days=3,
+        chunk_days=30,
+        max_reject_rate=1.0,
+        fetch=wrong_article,
+    )
+
+    assert summary.status == "ok"
+    assert summary.rows_quarantined > 0
+    assert "milford-sound" in summary.note, (
+        f"a venue rejecting every row is not named in the note: {summary.note!r}"
+    )
+    assert "rejected" in summary.note
