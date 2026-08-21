@@ -22,7 +22,7 @@ pip install -r requirements.txt
 
 python demo.py                     # offline, synthetic API, no network needed
 python -m nz_attraction_pageviews  # live, hits the Wikimedia API
-pytest -q                          # 167 tests, all offline
+pytest -q                          # 171 tests, all offline
 ```
 
 `demo.py` output:
@@ -176,13 +176,20 @@ overtook the frontier for good and the venue never loaded another row. So the
 trust line is also bounded by the newest day *any* venue has produced a row for,
 this run or in any run before it — publication is a property of the API, not of
 one article. During a stall that frontier stops, the trust line stops with it,
-and the days cost a re-request instead of vanishing. With no evidence at all — an empty
-warehouse and a run that fetched nothing — the calendar line stands, so a first
-run against quiet venues still makes progress. Once the warehouse holds a single
-row that escape hatch closes, which is the point: from then on the frontier is
-the honest answer to "has anything been published this recently?". A venue that
-stops advancing is named in `run_log.note` as *N days behind*, so holding is
-visible rather than something you have to notice.
+and the days cost a re-request instead of vanishing.
+
+With no evidence at all — an empty warehouse and a run that fetched nothing —
+**no watermark moves.** The calendar line used to stand here, so that a first
+run against quiet venues still made progress. That was the same bet the
+frontier exists to refuse, and it was open exactly while the warehouse was
+empty, which an outage keeps true indefinitely: every night the run reported
+`ok` and stepped every watermark forward one day on a calendar date alone.
+Measured on a fresh deploy whose first night hit an upstream incident, 84 of
+the 89 days the API had were skipped permanently. "Quiet" and "the upstream is
+down" are indistinguishable in a response, so with no evidence the safe reading
+is the one that costs a re-request. A venue that stops advancing is named in
+`run_log.note` — *N days behind*, or *no rows ever* — so holding is visible
+rather than something you have to notice.
 
 So the watermark advances to the last day actually loaded, holes behind it
 included, or to the trust line, whichever is
@@ -262,7 +269,7 @@ Applied per row, in this order:
 
 ## Testing
 
-167 tests, no network. The HTTP call is injected into `fetch_window` and the
+171 tests, no network. The HTTP call is injected into `fetch_window` and the
 fetcher is injected into `ingest.run`, so the suite drives real code paths with
 stubbed transport rather than mocking out the logic being tested.
 
@@ -342,12 +349,15 @@ CI runs lint, format check, and tests on Python 3.10 through 3.13.
   (`v0: gave up on 12 days`) rather than happening quietly. A stuck venue is a
   query — `SELECT venue_id, last_date FROM watermark ORDER BY last_date` — not a
   surprise six months later.
-- The watermark advances to the end of the requested range, including windows
-  that came back empty. Otherwise a genuinely quiet venue would be re-requested
-  forever. Decision 1 is what makes that safe: an empty window is verified
-  against a wider request before the watermark moves past it. A Wikimedia outage
-  returning 404 instead of 503 for every width would still be recorded as "no
-  traffic". Catching that needs a backfill sweep, which is not built here.
+- An empty window advances the watermark only as far as the trust line —
+  `today - 7` — and not at all until something, anywhere in the warehouse,
+  proves the upstream has published. That stops a quiet venue being
+  re-requested forever without letting an outage consume the backfill. Decision
+  1 is the other half: an empty window is verified against a wider request, and
+  then subdivided, before the watermark moves past it. A Wikimedia outage
+  returning 404 instead of 503 for *every* width, on a warehouse that already
+  holds rows, would still be recorded as "no traffic" for days older than the
+  trust line. Catching that needs a backfill sweep, which is not built here.
 - No orchestrator. In production this would be an Airflow or cron task; the
   entry point is deliberately a single idempotent command so that wiring it up
   is one line.

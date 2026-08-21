@@ -66,7 +66,7 @@ CREATE TABLE IF NOT EXISTS pageviews (
     view_date   DATE    NOT NULL,
     views       BIGINT  NOT NULL,
     run_id      VARCHAR NOT NULL,
-    loaded_at   TIMESTAMP NOT NULL,
+    loaded_at   TIMESTAMPTZ NOT NULL,
     PRIMARY KEY (venue_id, view_date)
 );
 
@@ -80,19 +80,19 @@ CREATE TABLE IF NOT EXISTS quarantine (
     rule       VARCHAR NOT NULL,
     detail     VARCHAR,
     raw        VARCHAR,
-    seen_at    TIMESTAMP NOT NULL
+    seen_at    TIMESTAMPTZ NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS watermark (
     venue_id   VARCHAR PRIMARY KEY,
     last_date  DATE NOT NULL,
-    updated_at TIMESTAMP NOT NULL
+    updated_at TIMESTAMPTZ NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS run_log (
     run_id            VARCHAR PRIMARY KEY,
-    started_at        TIMESTAMP NOT NULL,
-    finished_at       TIMESTAMP,
+    started_at        TIMESTAMPTZ NOT NULL,
+    finished_at       TIMESTAMPTZ,
     status            VARCHAR NOT NULL,
     venues            INTEGER NOT NULL,
     requests          INTEGER NOT NULL,
@@ -109,8 +109,28 @@ CREATE TABLE IF NOT EXISTS run_log (
 # fails on the column count. Adding the column is idempotent, and every insert in
 # this module names its columns, so it does not matter that a migrated column
 # lands at the end rather than in the middle where the DDL above puts it.
+# TIMESTAMP is timezone-NAIVE in DuckDB. Every datetime this module writes is
+# built with datetime.now(UTC), and DuckDB converted each one to the session's
+# local wall time on the way in and dropped the offset: a row loaded at 09:53
+# UTC was stored as 21:53 on an NZST host. So the one set of values that is
+# explicitly UTC by construction was the one set stored in local time, sitting
+# beside a view_date that genuinely is a UTC day. The same file read on a host
+# in another zone reported different absolute times for the same run, and in a
+# DST zone the local clock steps backwards once a year, so `ORDER BY started_at
+# DESC` - the query the README recommends - could return two runs an hour apart
+# in the wrong order.
+#
+# TIMESTAMPTZ stores the instant. The ALTERs are also a correct repair for
+# existing data: DuckDB reads a naive value as local when widening, and local is
+# exactly what those rows were written as, so they round-trip back to the UTC
+# instant they should always have been.
 MIGRATIONS = """
 ALTER TABLE quarantine ADD COLUMN IF NOT EXISTS view_date DATE;
+ALTER TABLE pageviews  ALTER COLUMN loaded_at   SET DATA TYPE TIMESTAMPTZ;
+ALTER TABLE quarantine ALTER COLUMN seen_at     SET DATA TYPE TIMESTAMPTZ;
+ALTER TABLE watermark  ALTER COLUMN updated_at  SET DATA TYPE TIMESTAMPTZ;
+ALTER TABLE run_log    ALTER COLUMN started_at  SET DATA TYPE TIMESTAMPTZ;
+ALTER TABLE run_log    ALTER COLUMN finished_at SET DATA TYPE TIMESTAMPTZ;
 """
 
 
@@ -234,7 +254,7 @@ def _venue_watermark(
     end: date,
     venue_clean: list[quality.CleanRow],
     venue_bad: list[quality.BadRow],
-    trusted_end: date,
+    trusted_end: date | None,
 ) -> date | None:
     """How far this venue may advance. None means leave the watermark alone.
 
@@ -259,6 +279,11 @@ def _venue_watermark(
     - Past that, only age helps. An absent day older than `trusted_end` is taken
       as quiet; a more recent one is left alone and asked for again next run,
       which is what stops a long publication lag becoming a permanent hole.
+
+    `trusted_end` is None when nothing anywhere proves the upstream has
+    published anything - see run(). Age is then no evidence at all, so an
+    absent day cannot be called quiet and the watermark advances only as far as
+    a day that actually arrived.
     """
     if any(row.view_date is None for row in venue_bad):
         # A row rejected by `timestamp_parses` cannot be pinned to a day, so we
@@ -274,9 +299,16 @@ def _venue_watermark(
     in_window = [row.view_date for row in venue_bad if start <= row.view_date <= end]
     ceiling = min(in_window) - timedelta(days=1) if in_window else end
 
-    trusted = min(end, trusted_end)
     loaded = [row.view_date for row in venue_clean]
-    frontier = max(max(loaded), trusted) if loaded else trusted
+    if trusted_end is None:
+        # No evidence the upstream has published anything. Advance only to a
+        # day that actually arrived, and not at all if none did.
+        if not loaded:
+            return None
+        frontier = max(loaded)
+    else:
+        trusted = min(end, trusted_end)
+        frontier = max(max(loaded), trusted) if loaded else trusted
 
     frontier = min(frontier, ceiling)
     return frontier if frontier >= start else None
@@ -391,14 +423,22 @@ def run(
         # with the run still reporting `ok`. Bounding the line by what has
         # actually been seen makes a stall cost a re-request instead.
         #
-        # With no evidence anywhere - an empty warehouse and a run that fetched
-        # nothing - the calendar line stands, so a set of venues that are all
-        # genuinely quiet still makes progress. That is the failure in the other
-        # direction, and it is the one the trust lag was introduced to avoid.
+        # With no evidence anywhere - an empty warehouse and a run that
+        # fetched nothing - the calendar line used to stand, on the reasoning
+        # that a set of genuinely quiet venues should still make progress. That
+        # is the same bet the frontier bound above exists to refuse, and it is
+        # open exactly when the warehouse is empty, which an outage keeps true
+        # indefinitely: every night the run reported `ok` and stepped every
+        # watermark forward one day on a calendar date alone.
+        #
+        # Measured on a fresh deploy whose first night hit an upstream
+        # incident: of the 89 days the API had and the run asked for, 5 were
+        # stored and 84 were skipped permanently, both runs `ok`. "Quiet" and
+        # "the upstream is down" look identical in a response, so with no
+        # evidence the safe reading is the one that costs a re-request rather
+        # than the data. None means "hold"; see _venue_watermark.
         observed = _publication_frontier(con, clean, end)
-        trusted_end = calendar_trust_line
-        if observed is not None:
-            trusted_end = min(trusted_end, observed)
+        trusted_end = None if observed is None else min(calendar_trust_line, observed)
 
         for venue, start, venue_clean, venue_bad in fetched:
             frontier = _venue_watermark(start, end, venue_clean, venue_bad, trusted_end)
@@ -423,9 +463,26 @@ def run(
             # rather than losing the days, but it should not be something you have
             # to notice for yourself. A healthy venue sits within a day or two of
             # `end`, so the trust lag is a generous threshold.
+            #
+            # The two conditions used to meet in the middle and leave a gap.
+            # The first required venue_bad to be EMPTY, so a venue that was
+            # returning rows and having all of them rejected was excluded from
+            # "no rows ever"; the second reads `effective`, which is None for a
+            # venue that has never set a watermark, so it was excluded there
+            # too. A venue whose article title resolves to a DIFFERENT article
+            # - the realistic hazard, since the API is title-exact and
+            # redirects are silent - lands exactly there: every row fails
+            # article_matches_request, seven healthy venues dilute the reject
+            # rate below the gate, the run reports `ok`, and the note is empty.
+            # It re-fetches and re-quarantines the same window every night
+            # forever. The test is now "has this venue ever loaded a row",
+            # which is the question the alert was always asking.
             effective = new_watermarks.get(venue.venue_id, current)
-            if not venue_clean and not venue_bad and not _has_any_rows(con, venue.venue_id):
-                silent.append(f"{venue.venue_id}: no rows ever, check {venue.wiki_article!r}")
+            if not _has_any_rows(con, venue.venue_id) and not venue_clean:
+                detail = f", {len(venue_bad)} row(s) rejected" if venue_bad else ""
+                silent.append(
+                    f"{venue.venue_id}: no rows ever{detail}, check {venue.wiki_article!r}"
+                )
             elif effective is not None and (end - effective).days > trust_lag_days:
                 silent.append(f"{venue.venue_id}: {(end - effective).days} days behind")
 
