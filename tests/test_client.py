@@ -784,3 +784,63 @@ def test_retry_after_is_found_whatever_the_server_capitalised_it_as(spelling):
     checked by hand, so a proxy sending any other one fell through to our own
     backoff and the delay the server asked for was silently ignored."""
     assert client._backoff_seconds(1, {spelling: "30"}) == 30.0
+
+
+def test_a_truncated_response_is_a_transport_failure_not_a_crash(monkeypatch):
+    """http.client.HTTPException is NOT an OSError.
+
+    IncompleteRead - what a truncated chunked response raises - inherits
+    straight from Exception, so it escaped the transport handler entirely and
+    propagated out of http_get, out of fetch_window, out of run(). One
+    truncated response killed the whole night for all eight venues, with zero
+    retries, on precisely the class of failure retries exist for.
+    """
+    import http.client
+    import urllib.request
+
+    def truncated(request, timeout=None):
+        raise http.client.IncompleteRead(b"half a payl")
+
+    monkeypatch.setattr(urllib.request, "urlopen", truncated)
+
+    status, headers, body = client.http_get("https://example.invalid/x")
+    assert status == client.TRANSPORT_STATUS
+    assert body == b""
+
+
+def test_a_truncated_error_body_is_also_a_transport_failure(monkeypatch):
+    """An error response can be cut off mid-read just as a success one can, and
+    a 500 whose body never arrived is a transport failure, not a 500 worth
+    reporting as one."""
+    import http.client
+    import io
+    import urllib.error
+    import urllib.request
+
+    class _Cut(io.BytesIO):
+        """A real file object - HTTPError's context manager closes it - whose
+        read() dies part way, as a truncated response does."""
+
+        def read(self, n=None):
+            raise http.client.IncompleteRead(b"")
+
+    exc = urllib.error.HTTPError("u", 500, "boom", {}, _Cut())
+
+    def raiser(request, timeout=None):
+        raise exc
+
+    monkeypatch.setattr(urllib.request, "urlopen", raiser)
+
+    status, _, body = client.http_get("https://example.invalid/x")
+    assert status == client.TRANSPORT_STATUS
+    assert body == b""
+
+
+def test_an_oversized_body_is_still_refused_not_swallowed():
+    """ApiError is a RuntimeError, so the new HTTPException handlers cannot
+    turn a refused body into a silent transport failure."""
+    assert issubclass(client.ApiError, RuntimeError)
+    import http.client
+
+    assert not issubclass(client.ApiError, http.client.HTTPException)
+    assert not issubclass(client.ApiError, OSError)
