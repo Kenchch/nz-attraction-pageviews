@@ -603,6 +603,25 @@ def run(
                     f"{venue.venue_id}: {fresh}/{seen} newly rejected, above the ceiling, held"
                 )
 
+        # Holding a venue has to mean holding it. Excluding it from the gate
+        # while still loading its rows was the worst of both: the whole-run
+        # gate could no longer refuse the extract, and `INSERT OR REPLACE`
+        # wrote the venue's surviving rows straight over days the warehouse
+        # already held from a good run. Measured with a venue 10/30 rejected:
+        # 20 clean rows went into the warehouse under a note saying "held".
+        #
+        # Its clean rows are dropped and its watermark stays put, so every day
+        # it covered is asked for again next run.
+        #
+        # `bad` is deliberately untouched: the venue's rejected rows still
+        # reach `quarantine`, so next run they are in `already`, `novel` for
+        # that venue is zero, it is no longer held, and it loads normally. That
+        # self-healing path is the whole reason the per-venue test is on novel
+        # rejections rather than raw ones.
+        clean = [r for r in clean if r.venue_id not in held]
+        for venue_id in held:
+            new_watermarks.pop(venue_id, None)
+
         gate_fetched = sum(
             len(venue_clean) + len(venue_bad)
             for venue, _s, venue_clean, venue_bad in fetched
@@ -612,15 +631,26 @@ def run(
 
         summary.note = "; ".join([*stalled, *silent])
 
-        if held and not gate_fetched:
-            # Every venue over the ceiling is not "eight separate problems", it
-            # is a bad extract, and the gate has to say so rather than passing
-            # vacuously on an empty numerator. Guarded on `held` rather than on
-            # `fetched`: a run where every venue legitimately returned NO rows
-            # also leaves gate_fetched at 0, and that is a quiet night.
+        # The whole-run gate the per-venue test replaced cannot fire on its
+        # own. Every venue still in it is by construction at or under the
+        # ceiling, and a weighted mean of values under a ceiling is under that
+        # ceiling, so `enforce_gate` below is arithmetically unreachable. It is
+        # kept because it is the correct expression of "the surviving rows are
+        # acceptable" and costs nothing, but it is not what refuses a bad
+        # extract.
+        #
+        # "Is tonight's extract broadly bad" therefore has to be asked about
+        # VENUES rather than rows: one venue of eight is one bad venue, but
+        # most of them at once is one bad extract. `max_reject_rate` is a
+        # per-row ceiling and means nothing at this level, so this is a
+        # majority. Venues that answered with nothing at all are not counted -
+        # a quiet night is not a failed one.
+        answering = [v.venue_id for v, _s, c, b in fetched if c or b]
+        if answering and len(held) * 2 > len(answering):
             raise quality.QualityGateFailed(
-                f"every venue rejected above the {max_reject_rate:.0%} ceiling "
-                f"- this is a bad extract, not {len(held)} bad venues."
+                f"{len(held)} of {len(answering)} venues that answered rejected "
+                f"above the {max_reject_rate:.0%} ceiling - this is a bad "
+                f"extract, not {len(held)} bad venues."
             )
         quality.enforce_gate(gate_fetched, len(gate_bad), max_reject_rate)
 

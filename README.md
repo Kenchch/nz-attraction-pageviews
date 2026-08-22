@@ -22,7 +22,7 @@ pip install -r requirements.txt
 
 python demo.py                     # offline, synthetic API, no network needed
 python -m nz_attraction_pageviews  # live, hits the Wikimedia API
-pytest -q                          # 180 tests, all offline
+pytest -q                          # 184 tests, all offline
 ```
 
 `demo.py` output:
@@ -222,12 +222,26 @@ moved, and the seven healthy venues stored **zero rows** — indefinitely. Once
 the oldest held day passed `max_lookback_days`, all eight would have given up on
 it together. One silent redirect upstream cost the whole warehouse.
 
-So a venue whose own *newly* rejected share is over the ceiling is **held**: its
-rows are quarantined, its watermark stays put, it is named in `run_log.note`,
-and it gets no vote in "is tonight's extract broadly bad". If every venue is
-held, that is a bad extract and the gate says so rather than passing on an empty
-numerator. Decision 4 is what makes all of it safe — the run continues, but no
-venue advances past a day it did not load.
+So a venue whose own *newly* rejected share is over the ceiling is **held**,
+and held means held: its clean rows are dropped, its watermark stays put, its
+rejected rows still go to `quarantine`, and it is named in `run_log.note`.
+Loading a held venue's surviving rows would be the worst of both — the run gate
+could no longer refuse the extract, and `INSERT OR REPLACE` would write those
+rows over days the warehouse already held from a good run. Every day it covered
+is simply asked for again next run.
+
+It heals itself. Those rejected rows are in `quarantine` by the next run, so
+they are no longer *novel*, the venue drops out of `held`, and it loads
+normally — which is why the per-venue test is on new rejections rather than
+raw ones.
+
+**The broad-failure question is asked about venues, not rows.** Once the held
+venues are excluded, every venue left is by construction at or under the
+ceiling, and a weighted mean of values under a ceiling is under that ceiling —
+so a row-rate gate over the survivors is arithmetically unreachable. One venue
+of eight is one bad venue; a majority of the venues that answered is one bad
+extract, and that is what refuses it. Decision 4 is what makes all of it safe —
+the run continues, but no venue advances past a day it did not load.
 
 **6. The load is one transaction, and re-running is free.**
 `pageviews` is keyed on `(venue_id, view_date)` and loaded with
@@ -289,7 +303,7 @@ Applied per row, in this order:
 
 ## Testing
 
-180 tests, no network. The HTTP call is injected into `fetch_window` and the
+184 tests, no network. The HTTP call is injected into `fetch_window` and the
 fetcher is injected into `ingest.run`, so the suite drives real code paths with
 stubbed transport rather than mocking out the logic being tested.
 
