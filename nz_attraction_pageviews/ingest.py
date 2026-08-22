@@ -124,6 +124,14 @@ class Venue:
 
 
 @dataclass
+class Fetched:
+    venue: Venue
+    start: date
+    clean: list[quality.CleanRow]
+    bad: list[quality.BadRow]
+
+
+@dataclass
 class RunSummary:
     run_id: str
     status: str
@@ -333,18 +341,13 @@ def _venue_watermark(
     return frontier if frontier >= start else None
 
 
-def run(
-    con,
-    venues: list[Venue],
-    *,
-    today: date | None = None,
-    chunk_days: int = DEFAULT_CHUNK_DAYS,
-    backfill_days: int = DEFAULT_BACKFILL_DAYS,
-    max_reject_rate: float = DEFAULT_MAX_REJECT_RATE,
-    max_lookback_days: int = DEFAULT_MAX_LOOKBACK_DAYS,
-    trust_lag_days: int = TRUST_LAG_DAYS,
-    fetch=client.fetch_window,
-) -> RunSummary:
+def _validate_params(
+    chunk_days: int,
+    backfill_days: int,
+    max_reject_rate: float,
+    max_lookback_days: int,
+    trust_lag_days: int,
+) -> None:
     # Validated rather than trusted, because the failure modes are silent. A
     # max_reject_rate of nan disables the gate outright - every comparison
     # against nan is False, so no rate is ever "too high" and a run that
@@ -373,6 +376,286 @@ def run(
             f"is False, so no run is ever rejected."
         )
 
+
+def _fetch_all(
+    con,
+    venues: list[Venue],
+    *,
+    end: date,
+    floor: date,
+    chunk_days: int,
+    backfill_days: int,
+    today: date,
+    fetch,
+    summary: RunSummary,
+    clean: list[quality.CleanRow],
+    bad: list[quality.BadRow],
+    stalled: list[str],
+) -> tuple[list[Fetched], list[str]]:
+    fetched: list[Fetched] = []
+    for venue in venues:
+        start = start_date_for(con, venue, end, backfill_days)
+        if start < floor:
+            # Stuck on a bad day for longer than we are willing to re-ask.
+            # Give up on the span below the floor, but say so out loud.
+            stalled.append(f"{venue.venue_id}: gave up on {(floor - start).days} days")
+            start = floor
+        if start > end:
+            continue  # already current, nothing to ask for
+
+        venue_clean: list[quality.CleanRow] = []
+        venue_bad: list[quality.BadRow] = []
+
+        for window_start, window_end in plan_windows(start, end, chunk_days):
+            # Counted BEFORE the call. The failure path writes this summary
+            # to the run log, and incrementing afterwards meant the request
+            # that raised was never counted - so the one run whose request
+            # count matters read one short, and a venue that failed on its
+            # first window logged `requests 0` while having gone to the
+            # network. The field answers "how many windows did we ask for",
+            # which is decided when we ask, not when we get an answer.
+            summary.requests += 1
+            items = fetch(venue.wiki_article, window_start, window_end)
+            summary.rows_fetched += len(items)
+
+            good, rejected = quality.check_window(
+                items,
+                venue_id=venue.venue_id,
+                article=venue.wiki_article,
+                start=window_start,
+                end=window_end,
+                today=today,
+            )
+            venue_clean.extend(good)
+            venue_bad.extend(rejected)
+
+        clean.extend(venue_clean)
+        bad.extend(venue_bad)
+        fetched.append(Fetched(venue, start, venue_clean, venue_bad))
+
+    return fetched, stalled
+
+
+def _advance_watermarks(
+    con,
+    fetched: list[Fetched],
+    *,
+    end: date,
+    trusted_end: date | None,
+    trust_lag_days: int,
+    silent: list[str],
+) -> tuple[dict[str, date], list[str]]:
+    new_watermarks: dict[str, date] = {}
+    for f in fetched:
+        venue, start, venue_clean, venue_bad = f.venue, f.start, f.clean, f.bad
+        frontier = _venue_watermark(start, end, venue_clean, venue_bad, trusted_end)
+        # Never move a watermark backwards. A venue already current past the
+        # trust line would otherwise be dragged back to it and re-fetch the
+        # same days every night.
+        current = get_watermark(con, venue.venue_id)
+        if frontier is not None and (current is None or frontier > current):
+            new_watermarks[venue.venue_id] = frontier
+
+        # Two shapes worth naming, both of which look like `ok` otherwise.
+        #
+        # A venue that asked for its whole range and has never produced a row
+        # is what a typo in `venues.csv` makes: the article does not exist,
+        # every width and slice 404s, the window verifies as genuinely empty,
+        # and the run retires the backfill. A venue that is simply quiet has
+        # the same shape, and deserves the same second look.
+        #
+        # A venue whose watermark is falling further behind `end` every night
+        # is stuck - on a day it cannot load, or on a frontier that is not
+        # moving. Holding is the intended behaviour, since it re-requests
+        # rather than losing the days, but it should not be something you have
+        # to notice for yourself. A healthy venue sits within a day or two of
+        # `end`, so the trust lag is a generous threshold.
+        #
+        # The two conditions used to meet in the middle and leave a gap.
+        # The first required venue_bad to be EMPTY, so a venue that was
+        # returning rows and having all of them rejected was excluded from
+        # "no rows ever"; the second reads `effective`, which is None for a
+        # venue that has never set a watermark, so it was excluded there
+        # too. A venue whose article title resolves to a DIFFERENT article
+        # - the realistic hazard, since the API is title-exact and
+        # redirects are silent - lands exactly there: every row fails
+        # article_matches_request and the note was empty, so the only
+        # signal was the gate - which does not report a venue, it stops the
+        # pipeline. (An earlier version of this comment claimed the healthy
+        # venues "dilute the reject rate below the gate". They do not:
+        # one venue of eight is 12.5% against a 5% ceiling.) The test is
+        # now "has this venue ever loaded a row", which is the question the
+        # alert was always asking.
+        effective = new_watermarks.get(venue.venue_id, current)
+        if not _has_any_rows(con, venue.venue_id) and not venue_clean:
+            detail = f", {len(venue_bad)} row(s) rejected" if venue_bad else ""
+            silent.append(f"{venue.venue_id}: no rows ever{detail}, check {venue.wiki_article!r}")
+        else:
+            # Measured from the last day this venue actually PRODUCED, not
+            # from its watermark. The watermark walks the trust line on
+            # other venues' evidence whether or not this article is still
+            # being served, so it sits at exactly
+            # `trust_lag_days - PUBLICATION_LAG_DAYS` behind `end` and can
+            # never satisfy `> trust_lag_days`. An article renamed or
+            # deleted upstream was therefore skipped day after day by a
+            # watermark that was, in this scenario, the thing telling the
+            # lie - and the alert built to catch it could not fire.
+            last = con.execute(
+                "SELECT max(view_date) FROM pageviews WHERE venue_id = ?",
+                [venue.venue_id],
+            ).fetchone()[0]
+            if venue_clean:
+                newest = max(r.view_date for r in venue_clean)
+                last = newest if last is None else max(last, newest)
+            if last is not None and (end - last).days > trust_lag_days:
+                silent.append(
+                    f"{venue.venue_id}: no rows for {(end - last).days} days "
+                    f"(watermark {effective}), check {venue.wiki_article!r}"
+                )
+
+    return new_watermarks, silent
+
+
+def _apply_gate(
+    con,
+    fetched: list[Fetched],
+    bad: list[quality.BadRow],
+    max_reject_rate: float,
+    silent: list[str],
+) -> set[str]:
+    # The gate fires on what is NEW.
+    #
+    # A day already sitting in `quarantine` for the same rule cannot be
+    # lost a second time - _venue_watermark is already holding the
+    # watermark short of it, which is the whole mechanism by which nothing
+    # is lost. Counting it again every night turns one broken venue into a
+    # permanent stoppage of the entire pipeline, and the rate it pins is
+    # scale-invariant: one venue of eight rejecting everything gives
+    # 1/8 = 12.5% however long the range or however many venues there are.
+    # Growth does not dilute it; adding venues does not dilute it.
+    #
+    # Measured, with one venue whose title had drifted so the API answered
+    # 200 with a different article:
+    #
+    #   night 0: GATE TRIPPED rate=0.125
+    #   night 1: GATE TRIPPED rate=0.125
+    #   ... every night, indefinitely
+    #   rows stored for the SEVEN HEALTHY venues : 0
+    #
+    # Nothing loads, so no watermark moves, so every venue re-fetches the
+    # same window forever - and once the oldest held day falls past
+    # max_lookback_days, all eight venues give up on it together. A single
+    # silent redirect upstream costs the whole warehouse.
+    #
+    # The gate exists to stop a bad EXTRACT reaching the warehouse. A day
+    # that has already been quarantined is not part of this extract's
+    # verdict; it is a standing problem, and `run_log.note` is what reports
+    # a standing problem.
+    already = {
+        (r[0], r[1], r[2])
+        for r in con.execute("SELECT venue_id, view_date, rule FROM quarantine").fetchall()
+    }
+    novel = [r for r in bad if (r.venue_id, r.view_date, r.rule) not in already]
+
+    if len(novel) != len(bad):
+        # Otherwise the log shows a rate above the ceiling on a run that
+        # passed, and nothing says why.
+        silent.append(
+            f"{len(bad) - len(novel)} of {len(bad)} rejected rows were "
+            f"already quarantined; gate saw {len(novel)}"
+        )
+
+    # ... and it fires per VENUE before it fires globally.
+    #
+    # Novel-only is necessary but not sufficient on its own: `quarantine`
+    # is written by _load, which runs AFTER this, so a venue that breaks
+    # all at once persists nothing, `already` stays empty, and every night
+    # looks like the first. A venue whose NOVEL rejection rate is over the
+    # ceiling is broken on its own terms and does not get a vote in "is
+    # tonight's extract broadly bad". Its rows are still quarantined, its
+    # watermark is still held short of them by _venue_watermark, and it is
+    # named in the note. What changes is that it can no longer stop the
+    # other seven venues from loading.
+    #
+    # Novel, not raw, for the per-venue test too. A venue stuck re-fetching
+    # one known-bad day is 100% rejected every night on a window of one -
+    # so a raw test would hold it forever, and if every venue is stuck on
+    # its own bad day it would hold all of them and deadlock exactly as
+    # before. Nothing is NEWLY wrong with such a venue; the standing
+    # problem is what run_log.note reports.
+    novel_by_venue = collections.Counter(r.venue_id for r in novel)
+    held = set()
+    for f in fetched:
+        venue, venue_clean, venue_bad = f.venue, f.clean, f.bad
+        seen = len(venue_clean) + len(venue_bad)
+        fresh = novel_by_venue.get(venue.venue_id, 0)
+        if seen and quality.reject_rate(seen, fresh) > max_reject_rate:
+            held.add(venue.venue_id)
+            silent.append(
+                f"{venue.venue_id}: {fresh}/{seen} newly rejected, above the ceiling, held"
+            )
+
+    # Holding a venue has to mean holding it. Excluding it from the gate
+    # while still loading its rows was the worst of both: the whole-run
+    # gate could no longer refuse the extract, and `INSERT OR REPLACE`
+    # wrote the venue's surviving rows straight over days the warehouse
+    # already held from a good run. Measured with a venue 10/30 rejected:
+    # 20 clean rows went into the warehouse under a note saying "held".
+    #
+    # Its clean rows are dropped and its watermark stays put, so every day
+    # it covered is asked for again next run.
+    #
+    # `bad` is deliberately untouched: the venue's rejected rows still
+    # reach `quarantine`, so next run they are in `already`, `novel` for
+    # that venue is zero, it is no longer held, and it loads normally. That
+    # self-healing path is the whole reason the per-venue test is on novel
+    # rejections rather than raw ones.
+    gate_fetched = sum(
+        len(venue_clean) + len(venue_bad)
+        for venue, venue_clean, venue_bad in ((f.venue, f.clean, f.bad) for f in fetched)
+        if venue.venue_id not in held
+    )
+    gate_bad = [r for r in novel if r.venue_id not in held]
+
+    # The whole-run gate the per-venue test replaced cannot fire on its
+    # own. Every venue still in it is by construction at or under the
+    # ceiling, and a weighted mean of values under a ceiling is under that
+    # ceiling, so `enforce_gate` below is arithmetically unreachable. It is
+    # kept because it is the correct expression of "the surviving rows are
+    # acceptable" and costs nothing, but it is not what refuses a bad
+    # extract.
+    #
+    # "Is tonight's extract broadly bad" therefore has to be asked about
+    # VENUES rather than rows: one venue of eight is one bad venue, but
+    # most of them at once is one bad extract. `max_reject_rate` is a
+    # per-row ceiling and means nothing at this level, so this is a
+    # majority. Venues that answered with nothing at all are not counted -
+    # a quiet night is not a failed one.
+    answering = [f.venue.venue_id for f in fetched if f.clean or f.bad]
+    if answering and len(held) * 2 > len(answering):
+        raise quality.QualityGateFailed(
+            f"{len(held)} of {len(answering)} venues that answered rejected "
+            f"above the {max_reject_rate:.0%} ceiling - this is a bad "
+            f"extract, not {len(held)} bad venues."
+        )
+    quality.enforce_gate(gate_fetched, len(gate_bad), max_reject_rate)
+
+    return held
+
+
+def run(
+    con,
+    venues: list[Venue],
+    *,
+    today: date | None = None,
+    chunk_days: int = DEFAULT_CHUNK_DAYS,
+    backfill_days: int = DEFAULT_BACKFILL_DAYS,
+    max_reject_rate: float = DEFAULT_MAX_REJECT_RATE,
+    max_lookback_days: int = DEFAULT_MAX_LOOKBACK_DAYS,
+    trust_lag_days: int = TRUST_LAG_DAYS,
+    fetch=client.fetch_window,
+) -> RunSummary:
+    _validate_params(chunk_days, backfill_days, max_reject_rate, max_lookback_days, trust_lag_days)
     today = today or datetime.now(UTC).date()
     end = today - timedelta(days=PUBLICATION_LAG_DAYS)
     floor = end - timedelta(days=max_lookback_days - 1)
@@ -390,45 +673,20 @@ def run(
     fetched: list[tuple[Venue, date, list[quality.CleanRow], list[quality.BadRow]]] = []
 
     try:
-        for venue in venues:
-            start = start_date_for(con, venue, end, backfill_days)
-            if start < floor:
-                # Stuck on a bad day for longer than we are willing to re-ask.
-                # Give up on the span below the floor, but say so out loud.
-                stalled.append(f"{venue.venue_id}: gave up on {(floor - start).days} days")
-                start = floor
-            if start > end:
-                continue  # already current, nothing to ask for
-
-            venue_clean: list[quality.CleanRow] = []
-            venue_bad: list[quality.BadRow] = []
-
-            for window_start, window_end in plan_windows(start, end, chunk_days):
-                # Counted BEFORE the call. The failure path writes this summary
-                # to the run log, and incrementing afterwards meant the request
-                # that raised was never counted - so the one run whose request
-                # count matters read one short, and a venue that failed on its
-                # first window logged `requests 0` while having gone to the
-                # network. The field answers "how many windows did we ask for",
-                # which is decided when we ask, not when we get an answer.
-                summary.requests += 1
-                items = fetch(venue.wiki_article, window_start, window_end)
-                summary.rows_fetched += len(items)
-
-                good, rejected = quality.check_window(
-                    items,
-                    venue_id=venue.venue_id,
-                    article=venue.wiki_article,
-                    start=window_start,
-                    end=window_end,
-                    today=today,
-                )
-                venue_clean.extend(good)
-                venue_bad.extend(rejected)
-
-            clean.extend(venue_clean)
-            bad.extend(venue_bad)
-            fetched.append((venue, start, venue_clean, venue_bad))
+        fetched, stalled = _fetch_all(
+            con,
+            venues,
+            end=end,
+            floor=floor,
+            chunk_days=chunk_days,
+            backfill_days=backfill_days,
+            today=today,
+            fetch=fetch,
+            summary=summary,
+            clean=clean,
+            bad=bad,
+            stalled=stalled,
+        )
 
         # How far the upstream has demonstrably published. Publication is a
         # property of the API, not of one article, so the newest day seen for any
@@ -459,200 +717,27 @@ def run(
         observed = _publication_frontier(con, clean, end)
         trusted_end = None if observed is None else min(calendar_trust_line, observed)
 
-        for venue, start, venue_clean, venue_bad in fetched:
-            frontier = _venue_watermark(start, end, venue_clean, venue_bad, trusted_end)
-            # Never move a watermark backwards. A venue already current past the
-            # trust line would otherwise be dragged back to it and re-fetch the
-            # same days every night.
-            current = get_watermark(con, venue.venue_id)
-            if frontier is not None and (current is None or frontier > current):
-                new_watermarks[venue.venue_id] = frontier
-
-            # Two shapes worth naming, both of which look like `ok` otherwise.
-            #
-            # A venue that asked for its whole range and has never produced a row
-            # is what a typo in `venues.csv` makes: the article does not exist,
-            # every width and slice 404s, the window verifies as genuinely empty,
-            # and the run retires the backfill. A venue that is simply quiet has
-            # the same shape, and deserves the same second look.
-            #
-            # A venue whose watermark is falling further behind `end` every night
-            # is stuck - on a day it cannot load, or on a frontier that is not
-            # moving. Holding is the intended behaviour, since it re-requests
-            # rather than losing the days, but it should not be something you have
-            # to notice for yourself. A healthy venue sits within a day or two of
-            # `end`, so the trust lag is a generous threshold.
-            #
-            # The two conditions used to meet in the middle and leave a gap.
-            # The first required venue_bad to be EMPTY, so a venue that was
-            # returning rows and having all of them rejected was excluded from
-            # "no rows ever"; the second reads `effective`, which is None for a
-            # venue that has never set a watermark, so it was excluded there
-            # too. A venue whose article title resolves to a DIFFERENT article
-            # - the realistic hazard, since the API is title-exact and
-            # redirects are silent - lands exactly there: every row fails
-            # article_matches_request and the note was empty, so the only
-            # signal was the gate - which does not report a venue, it stops the
-            # pipeline. (An earlier version of this comment claimed the healthy
-            # venues "dilute the reject rate below the gate". They do not:
-            # one venue of eight is 12.5% against a 5% ceiling.) The test is
-            # now "has this venue ever loaded a row", which is the question the
-            # alert was always asking.
-            effective = new_watermarks.get(venue.venue_id, current)
-            if not _has_any_rows(con, venue.venue_id) and not venue_clean:
-                detail = f", {len(venue_bad)} row(s) rejected" if venue_bad else ""
-                silent.append(
-                    f"{venue.venue_id}: no rows ever{detail}, check {venue.wiki_article!r}"
-                )
-            else:
-                # Measured from the last day this venue actually PRODUCED, not
-                # from its watermark. The watermark walks the trust line on
-                # other venues' evidence whether or not this article is still
-                # being served, so it sits at exactly
-                # `trust_lag_days - PUBLICATION_LAG_DAYS` behind `end` and can
-                # never satisfy `> trust_lag_days`. An article renamed or
-                # deleted upstream was therefore skipped day after day by a
-                # watermark that was, in this scenario, the thing telling the
-                # lie - and the alert built to catch it could not fire.
-                last = con.execute(
-                    "SELECT max(view_date) FROM pageviews WHERE venue_id = ?",
-                    [venue.venue_id],
-                ).fetchone()[0]
-                if venue_clean:
-                    newest = max(r.view_date for r in venue_clean)
-                    last = newest if last is None else max(last, newest)
-                if last is not None and (end - last).days > trust_lag_days:
-                    silent.append(
-                        f"{venue.venue_id}: no rows for {(end - last).days} days "
-                        f"(watermark {effective}), check {venue.wiki_article!r}"
-                    )
+        new_watermarks, silent = _advance_watermarks(
+            con,
+            fetched,
+            end=end,
+            trusted_end=trusted_end,
+            trust_lag_days=trust_lag_days,
+            silent=silent,
+        )
 
         summary.rows_quarantined = len(bad)
         # Record the rate before the gate can raise, so a failed run logs the
         # number that explains why it failed rather than 0.0.
         summary.reject_rate = quality.reject_rate(summary.rows_fetched, summary.rows_quarantined)
 
-        # The gate fires on what is NEW.
-        #
-        # A day already sitting in `quarantine` for the same rule cannot be
-        # lost a second time - _venue_watermark is already holding the
-        # watermark short of it, which is the whole mechanism by which nothing
-        # is lost. Counting it again every night turns one broken venue into a
-        # permanent stoppage of the entire pipeline, and the rate it pins is
-        # scale-invariant: one venue of eight rejecting everything gives
-        # 1/8 = 12.5% however long the range or however many venues there are.
-        # Growth does not dilute it; adding venues does not dilute it.
-        #
-        # Measured, with one venue whose title had drifted so the API answered
-        # 200 with a different article:
-        #
-        #   night 0: GATE TRIPPED rate=0.125
-        #   night 1: GATE TRIPPED rate=0.125
-        #   ... every night, indefinitely
-        #   rows stored for the SEVEN HEALTHY venues : 0
-        #
-        # Nothing loads, so no watermark moves, so every venue re-fetches the
-        # same window forever - and once the oldest held day falls past
-        # max_lookback_days, all eight venues give up on it together. A single
-        # silent redirect upstream costs the whole warehouse.
-        #
-        # The gate exists to stop a bad EXTRACT reaching the warehouse. A day
-        # that has already been quarantined is not part of this extract's
-        # verdict; it is a standing problem, and `run_log.note` is what reports
-        # a standing problem.
-        already = {
-            (r[0], r[1], r[2])
-            for r in con.execute("SELECT venue_id, view_date, rule FROM quarantine").fetchall()
-        }
-        novel = [r for r in bad if (r.venue_id, r.view_date, r.rule) not in already]
+        held = _apply_gate(con, fetched, bad, max_reject_rate, silent)
 
-        if len(novel) != len(bad):
-            # Otherwise the log shows a rate above the ceiling on a run that
-            # passed, and nothing says why.
-            silent.append(
-                f"{len(bad) - len(novel)} of {len(bad)} rejected rows were "
-                f"already quarantined; gate saw {len(novel)}"
-            )
-
-        # ... and it fires per VENUE before it fires globally.
-        #
-        # Novel-only is necessary but not sufficient on its own: `quarantine`
-        # is written by _load, which runs AFTER this, so a venue that breaks
-        # all at once persists nothing, `already` stays empty, and every night
-        # looks like the first. A venue whose NOVEL rejection rate is over the
-        # ceiling is broken on its own terms and does not get a vote in "is
-        # tonight's extract broadly bad". Its rows are still quarantined, its
-        # watermark is still held short of them by _venue_watermark, and it is
-        # named in the note. What changes is that it can no longer stop the
-        # other seven venues from loading.
-        #
-        # Novel, not raw, for the per-venue test too. A venue stuck re-fetching
-        # one known-bad day is 100% rejected every night on a window of one -
-        # so a raw test would hold it forever, and if every venue is stuck on
-        # its own bad day it would hold all of them and deadlock exactly as
-        # before. Nothing is NEWLY wrong with such a venue; the standing
-        # problem is what run_log.note reports.
-        novel_by_venue = collections.Counter(r.venue_id for r in novel)
-        held = set()
-        for venue, _s, venue_clean, venue_bad in fetched:
-            seen = len(venue_clean) + len(venue_bad)
-            fresh = novel_by_venue.get(venue.venue_id, 0)
-            if seen and quality.reject_rate(seen, fresh) > max_reject_rate:
-                held.add(venue.venue_id)
-                silent.append(
-                    f"{venue.venue_id}: {fresh}/{seen} newly rejected, above the ceiling, held"
-                )
-
-        # Holding a venue has to mean holding it. Excluding it from the gate
-        # while still loading its rows was the worst of both: the whole-run
-        # gate could no longer refuse the extract, and `INSERT OR REPLACE`
-        # wrote the venue's surviving rows straight over days the warehouse
-        # already held from a good run. Measured with a venue 10/30 rejected:
-        # 20 clean rows went into the warehouse under a note saying "held".
-        #
-        # Its clean rows are dropped and its watermark stays put, so every day
-        # it covered is asked for again next run.
-        #
-        # `bad` is deliberately untouched: the venue's rejected rows still
-        # reach `quarantine`, so next run they are in `already`, `novel` for
-        # that venue is zero, it is no longer held, and it loads normally. That
-        # self-healing path is the whole reason the per-venue test is on novel
-        # rejections rather than raw ones.
         clean = [r for r in clean if r.venue_id not in held]
         for venue_id in held:
             new_watermarks.pop(venue_id, None)
 
-        gate_fetched = sum(
-            len(venue_clean) + len(venue_bad)
-            for venue, _s, venue_clean, venue_bad in fetched
-            if venue.venue_id not in held
-        )
-        gate_bad = [r for r in novel if r.venue_id not in held]
-
         summary.note = "; ".join([*stalled, *silent])
-
-        # The whole-run gate the per-venue test replaced cannot fire on its
-        # own. Every venue still in it is by construction at or under the
-        # ceiling, and a weighted mean of values under a ceiling is under that
-        # ceiling, so `enforce_gate` below is arithmetically unreachable. It is
-        # kept because it is the correct expression of "the surviving rows are
-        # acceptable" and costs nothing, but it is not what refuses a bad
-        # extract.
-        #
-        # "Is tonight's extract broadly bad" therefore has to be asked about
-        # VENUES rather than rows: one venue of eight is one bad venue, but
-        # most of them at once is one bad extract. `max_reject_rate` is a
-        # per-row ceiling and means nothing at this level, so this is a
-        # majority. Venues that answered with nothing at all are not counted -
-        # a quiet night is not a failed one.
-        answering = [v.venue_id for v, _s, c, b in fetched if c or b]
-        if answering and len(held) * 2 > len(answering):
-            raise quality.QualityGateFailed(
-                f"{len(held)} of {len(answering)} venues that answered rejected "
-                f"above the {max_reject_rate:.0%} ceiling - this is a bad "
-                f"extract, not {len(held)} bad venues."
-            )
-        quality.enforce_gate(gate_fetched, len(gate_bad), max_reject_rate)
 
         # Set before the load, because the load is what writes the run log now.
         summary.rows_loaded = len(clean)
