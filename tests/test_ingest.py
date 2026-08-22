@@ -1437,3 +1437,89 @@ def test_a_venue_with_rows_resumes_from_its_watermark(con):
         con, VENUES[0], TODAY - timedelta(days=ingest.PUBLICATION_LAG_DAYS), 10
     )
     assert start == watermark + timedelta(days=1)
+
+
+def test_a_held_venue_writes_nothing_and_does_not_move(con):
+    """Holding a venue has to mean holding it.
+
+    Excluding it from the gate while still loading its rows was the worst of
+    both: the whole-run gate could no longer refuse the extract, and
+    `INSERT OR REPLACE` wrote the venue's surviving rows straight over days the
+    warehouse already held from a good run. Measured with a venue 10/30
+    rejected: 20 clean rows went into the warehouse under a note saying "held".
+    """
+
+    def partly_bad(article, start, end):
+        rows = _daily(article, start, end)
+        if article == "Article_0":
+            for i, row in enumerate(rows):
+                if i % 3 == 0:
+                    row["views"] = -1
+        return rows
+
+    summary = ingest.run(con, EIGHT, today=TODAY, backfill_days=30, chunk_days=60, fetch=partly_bad)
+
+    assert "v0" in summary.note and "held" in summary.note
+    assert con.execute("SELECT count(*) FROM pageviews WHERE venue_id = 'v0'").fetchone()[0] == 0, (
+        "a held venue wrote rows"
+    )
+    assert ingest.get_watermark(con, "v0") is None, "a held venue advanced"
+    # The other seven are unaffected.
+    assert con.execute("SELECT count(DISTINCT venue_id) FROM pageviews").fetchone()[0] == 7
+
+
+def test_a_held_venue_heals_itself_on_the_next_run(con):
+    """Its bad rows still reach `quarantine`, so next run they are in
+    `already`, `novel` for that venue is zero, it is no longer held, and it
+    loads normally. That is why the per-venue test is on novel rejections."""
+
+    def partly_bad(article, start, end):
+        rows = _daily(article, start, end)
+        if article == "Article_0":
+            for i, row in enumerate(rows):
+                if i % 3 == 0:
+                    row["views"] = -1
+        return rows
+
+    ingest.run(con, EIGHT, today=TODAY, backfill_days=30, chunk_days=60, fetch=partly_bad)
+    assert con.execute("SELECT count(*) FROM quarantine WHERE venue_id = 'v0'").fetchone()[0] > 0, (
+        "the held venue's rejections were not recorded"
+    )
+
+    second = ingest.run(con, EIGHT, today=TODAY, backfill_days=30, chunk_days=60, fetch=partly_bad)
+
+    assert "v0: " not in second.note or "held" not in second.note
+    assert con.execute("SELECT count(*) FROM pageviews WHERE venue_id = 'v0'").fetchone()[0] > 0, (
+        "the venue never recovered"
+    )
+
+
+def test_a_majority_of_venues_rejecting_is_a_bad_extract(con):
+    """The whole-run gate cannot fire once the held venues are excluded: every
+    survivor is by construction at or under the ceiling, and a weighted mean of
+    values under a ceiling is under that ceiling. So the broad-failure question
+    is asked about VENUES - one of eight is one bad venue, five of eight is one
+    bad extract."""
+
+    def most_wrong(article, start, end):
+        broken = {f"Article_{i}" for i in range(5)}
+        if article in broken:
+            return _daily(article, start, end, name="Some_Other_Page")
+        return _daily(article, start, end)
+
+    with pytest.raises(quality.QualityGateFailed, match="5 of 8 venues"):
+        ingest.run(con, EIGHT, today=TODAY, backfill_days=10, chunk_days=30, fetch=most_wrong)
+
+
+def test_a_minority_of_venues_rejecting_is_not(con):
+    """Three of eight is still three bad venues, and the other five load."""
+
+    def some_wrong(article, start, end):
+        broken = {f"Article_{i}" for i in range(3)}
+        if article in broken:
+            return _daily(article, start, end, name="Some_Other_Page")
+        return _daily(article, start, end)
+
+    summary = ingest.run(con, EIGHT, today=TODAY, backfill_days=10, chunk_days=30, fetch=some_wrong)
+    assert summary.status == "ok"
+    assert con.execute("SELECT count(DISTINCT venue_id) FROM pageviews").fetchone()[0] == 5
