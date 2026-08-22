@@ -755,7 +755,26 @@ def run(
         summary.note = "; ".join([*stalled, *silent, f"{type(exc).__name__}: {exc}"])
         # Nothing was loaded on this path - the transaction rolled back, or never
         # opened - so this write stands alone and cannot contradict the data.
-        _write_run_log(con, summary, started_at)
+        #
+        # Except for the rejected rows, on a gate abort. The whole self-heal
+        # story ("those rejected rows are in `quarantine` by the next run, so
+        # they are no longer novel, the venue drops out of `held`") depends on
+        # quarantine being written, and quarantine is written by _load, which
+        # runs AFTER the gate. So an abort threw away the very record that lets
+        # the next run get past the same gate: `already` stayed empty, `novel`
+        # stayed equal to `bad`, `held` was the same set every night, and the
+        # majority branch re-armed itself forever - starving the healthy venues
+        # too, since their clean rows go through the same _load.
+        #
+        # Rejected rows only. No pageviews, no watermarks: the gate said do not
+        # trust tonight's extract, and that judgement stands. What changes is
+        # that the run now leaves behind the evidence of what it rejected, which
+        # is what turns "refuse tonight" into something other than "refuse
+        # forever".
+        if isinstance(exc, quality.QualityGateFailed) and bad:
+            _quarantine_rejects(con, run_id, bad, summary, started_at)
+        else:
+            _write_run_log(con, summary, started_at)
         raise
 
     return summary
@@ -787,6 +806,52 @@ def _publication_frontier(con, clean: list[quality.CleanRow], end: date) -> date
 def _has_any_rows(con, venue_id: str) -> bool:
     row = con.execute("SELECT 1 FROM pageviews WHERE venue_id = ? LIMIT 1", [venue_id]).fetchone()
     return row is not None
+
+
+def _quarantine_rejects(con, run_id, bad, summary, started_at) -> None:
+    """The gate-abort counterpart of _load: rejects and the run log, nothing else.
+
+    Same transaction shape as _load, and for the same reason - the run log has
+    to be atomic with what it claims. It claims rows_quarantined=N, and before
+    this existed that claim was false on every aborted run: the log said N and
+    the table held nothing.
+    """
+    now = utc_now()
+    # Only what is not already there. A stalled venue re-fetches the same window
+    # every night, so writing `bad` wholesale would add the same rejected day
+    # again on every one of them - the table would grow quadratically while
+    # `already` gained nothing, since it is a set on exactly this key.
+    already = {
+        (r[0], r[1], r[2])
+        for r in con.execute("SELECT venue_id, view_date, rule FROM quarantine").fetchall()
+    }
+    fresh = [r for r in bad if (r.venue_id, r.view_date, r.rule) not in already]
+    try:
+        con.execute("BEGIN TRANSACTION")
+        if fresh:
+            con.executemany(
+                "INSERT INTO quarantine "
+                "(run_id, venue_id, article, view_date, rule, detail, raw, seen_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                [
+                    (run_id, r.venue_id, r.article, r.view_date, r.rule, r.detail, r.raw, now)
+                    for r in fresh
+                ],
+            )
+        _write_run_log(con, summary, started_at)
+        con.execute("COMMIT")
+    except BaseException:
+        try:
+            con.execute("ROLLBACK")
+        except BaseException:
+            pass
+        # The run log matters more than the rejects: without it the run is
+        # invisible. Retry it alone, outside the transaction that just failed.
+        try:
+            _write_run_log(con, summary, started_at)
+        except BaseException:
+            pass
+        raise
 
 
 def _load(con, run_id, clean, bad, new_watermarks, summary, started_at) -> None:

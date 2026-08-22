@@ -175,11 +175,18 @@ def test_gate_failure_loads_nothing_and_is_logged(con):
         )
 
     assert con.execute("SELECT count(*) FROM pageviews").fetchone()[0] == good_rows
-    assert con.execute("SELECT count(*) FROM quarantine").fetchone()[0] == 0
-    status = con.execute("SELECT status FROM run_log ORDER BY started_at DESC LIMIT 1").fetchone()[
-        0
-    ]
-    assert status == "failed"
+    # The rejects DO land, and only they. "Loads nothing" is about the warehouse
+    # and the watermarks, not about the evidence: quarantine staying empty here
+    # is what deadlocked the gate, because the self-heal in _apply_gate reads
+    # this table to decide which rejects are still novel.
+    assert con.execute("SELECT count(*) FROM quarantine").fetchone()[0] > 0
+    assert con.execute("SELECT count(*) FROM watermark").fetchone()[0] == 0
+    logged = con.execute(
+        "SELECT status, rows_quarantined FROM run_log ORDER BY started_at DESC LIMIT 1"
+    ).fetchone()
+    assert logged[0] == "failed"
+    # And the log's own count is now true, which it never was on this path.
+    assert logged[1] >= con.execute("SELECT count(*) FROM quarantine").fetchone()[0]
 
 
 class Poisoner:
@@ -1523,3 +1530,134 @@ def test_a_minority_of_venues_rejecting_is_not(con):
     summary = ingest.run(con, EIGHT, today=TODAY, backfill_days=10, chunk_days=30, fetch=some_wrong)
     assert summary.status == "ok"
     assert con.execute("SELECT count(DISTINCT venue_id) FROM pageviews").fetchone()[0] == 5
+
+
+def test_a_majority_of_broken_venues_does_not_stop_the_pipeline_for_ever(con):
+    """The gate has to refuse a bad extract without refusing every later one.
+
+    The self-heal the per-venue test relies on - "tonight's rejects are in
+    `quarantine`, so tomorrow they are no longer novel, so the venue stops
+    being held" - is written by _load, and _load runs AFTER the gate. On the
+    majority branch the gate raises, so nothing was written, so `already`
+    stayed empty, `novel` stayed equal to `bad`, and the same venues were held
+    the next night, and the night after.
+
+    Measured on the code before the fix: 5 of 8 venues broken, thirty
+    consecutive nights, every one QualityGateFailed, quarantine 0 throughout,
+    and the three HEALTHY venues stored zero rows in a month - their clean rows
+    go through the same _load. A gate that cannot be got past is not a gate.
+    """
+    broken = {f"v{i}" for i in range(5)}  # 5 of 8 - a majority
+    state = {"broken": False}
+
+    def feed(article, start, end):
+        venue_id = f"v{article.rsplit('_', 1)[1]}"
+        bad_now = state["broken"] and venue_id in broken
+        return _daily(article, start, end, views=-1 if bad_now else 10)
+
+    ingest.run(con, EIGHT, today=TODAY, backfill_days=10, chunk_days=30, fetch=feed)
+    baseline = con.execute("SELECT count(*) FROM pageviews").fetchone()[0]
+
+    state["broken"] = True
+    statuses = []
+    for night in range(1, 31):
+        try:
+            statuses.append(
+                ingest.run(
+                    con,
+                    EIGHT,
+                    today=TODAY + timedelta(days=night),
+                    backfill_days=10,
+                    chunk_days=30,
+                    fetch=feed,
+                ).status
+            )
+        except quality.QualityGateFailed:
+            statuses.append("failed")
+
+    # It does refuse the bad extract, on the night it appears.
+    assert statuses[0] == "failed"
+    # Over the nights it kept refusing, the abort path never wrote a
+    # (venue, date, rule) it had written before. A stalled venue re-fetches its
+    # whole held window every night, so writing `bad` wholesale would re-add
+    # every day of it - and `already`, a set on exactly that key, would gain
+    # nothing for the extra rows.
+    aborted = [
+        r[0] for r in con.execute("SELECT run_id FROM run_log WHERE status = 'failed'").fetchall()
+    ]
+    assert len(aborted) > 1, "only one abort - this would measure nothing"
+    placeholders = ", ".join("?" * len(aborted))
+    total, distinct = con.execute(
+        f"SELECT count(*), count(DISTINCT (venue_id, view_date, rule)) "
+        f"FROM quarantine WHERE run_id IN ({placeholders})",
+        aborted,
+    ).fetchone()
+    assert total == distinct, "an abort re-quarantined a day already in the table"
+    # And it does not refuse for ever.
+    assert "ok" in statuses, "the gate never let another run through"
+
+    rows = con.execute("SELECT count(*) FROM pageviews").fetchone()[0]
+    assert rows > baseline, "the healthy venues never stored another row"
+
+    # Only the healthy ones got in. The broken venues are still held, and the
+    # gate's judgement about their data still stands.
+    loaded = {r[0] for r in con.execute("SELECT DISTINCT venue_id FROM pageviews").fetchall()}
+    assert loaded == {v.venue_id for v in EIGHT}, "night 0 was healthy for all eight"
+    after_break = con.execute(
+        "SELECT count(*) FROM pageviews WHERE venue_id IN ('v0','v1','v2','v3','v4')"
+    ).fetchone()[0]
+    assert after_break == baseline * 5 // 8, "a held venue's rows reached the warehouse"
+
+
+def test_an_aborted_run_writes_its_rejects_and_nothing_else(con):
+    """The evidence is not the data.
+
+    Watermarks and pageviews stay put - the gate said do not trust tonight's
+    extract. `quarantine` is what the next run reads to work out which
+    rejections are new, so throwing it away is what made the refusal permanent.
+    """
+    broken = {f"v{i}" for i in range(5)}
+
+    def feed(article, start, end):
+        venue_id = f"v{article.rsplit('_', 1)[1]}"
+        return _daily(article, start, end, views=-1 if venue_id in broken else 10)
+
+    with pytest.raises(quality.QualityGateFailed):
+        ingest.run(con, EIGHT, today=TODAY, backfill_days=5, chunk_days=30, fetch=feed)
+
+    assert con.execute("SELECT count(*) FROM quarantine").fetchone()[0] > 0
+    assert con.execute("SELECT count(*) FROM pageviews").fetchone()[0] == 0
+    assert con.execute("SELECT count(*) FROM watermark").fetchone()[0] == 0
+
+    # The run log's own count stops being a claim the table contradicts.
+    status, quarantined = con.execute(
+        "SELECT status, rows_quarantined FROM run_log ORDER BY started_at DESC LIMIT 1"
+    ).fetchone()
+    assert status == "failed"
+    assert quarantined == con.execute("SELECT count(*) FROM quarantine").fetchone()[0]
+
+
+def test_the_rejects_an_abort_left_behind_are_what_lets_the_next_run_through(con):
+    """The whole point of writing them, stated as one run following another.
+
+    Same extract both nights. The first is refused - five of eight venues
+    rejecting everything is a bad extract. The second is not, because those
+    rejections are no longer new: they sit in `quarantine`, `novel` is empty,
+    nothing is held, and the majority branch has nothing to fire on. The broken
+    venues' rows are still rejected; what changed is that the other three load.
+    """
+    broken = {f"v{i}" for i in range(5)}
+
+    def feed(article, start, end):
+        venue_id = f"v{article.rsplit('_', 1)[1]}"
+        return _daily(article, start, end, views=-1 if venue_id in broken else 10)
+
+    with pytest.raises(quality.QualityGateFailed):
+        ingest.run(con, EIGHT, today=TODAY, backfill_days=5, chunk_days=30, fetch=feed)
+    assert con.execute("SELECT count(*) FROM pageviews").fetchone()[0] == 0
+
+    summary = ingest.run(con, EIGHT, today=TODAY, backfill_days=5, chunk_days=30, fetch=feed)
+
+    assert summary.status == "ok"
+    loaded = {r[0] for r in con.execute("SELECT DISTINCT venue_id FROM pageviews").fetchall()}
+    assert loaded == {"v5", "v6", "v7"}, "a broken venue's rows reached the warehouse"
