@@ -22,7 +22,7 @@ pip install -r requirements.txt
 
 python demo.py                     # offline, synthetic API, no network needed
 python -m nz_attraction_pageviews  # live, hits the Wikimedia API
-pytest -q                          # 184 tests, all offline
+pytest -q                          # offline; network calls are stubbed
 ```
 
 `demo.py` output:
@@ -303,7 +303,7 @@ Applied per row, in this order:
 
 ## Testing
 
-184 tests, no network. The HTTP call is injected into `fetch_window` and the
+The suite runs without network access. The HTTP call is injected into `fetch_window` and the
 fetcher is injected into `ingest.run`, so the suite drives real code paths with
 stubbed transport rather than mocking out the logic being tested.
 
@@ -333,6 +333,14 @@ rejected with a line number for a blank field, a duplicate `venue_id` or a
 missing column while tolerating a BOM and an extra column.
 
 CI runs lint, format check, and tests on Python 3.10 through 3.13.
+
+## How this was built
+
+Built with AI pair-programming (Claude Code and OpenAI Codex) for drafting,
+refactoring and test scaffolding. I set the problem, designed the ingestion and
+quarantine contracts, chose the quality rules, ran the checks, and reviewed and
+edited the code. Commits where an assistant contributed code retain a
+`Co-Authored-By` trailer.
 
 ## Limits
 
