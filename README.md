@@ -5,6 +5,13 @@
 Incremental ingest of daily Wikipedia pageviews for eight New Zealand visitor
 attractions, into DuckDB.
 
+This project keeps a local history of pageviews and updates only the dates
+that need attention. It demonstrates how a data import can recover from
+unreliable responses without silently leaving gaps or inserting duplicates.
+
+**Start here:** [Try the offline demo](#run-it) · [Inspect the stored tables](#tables) ·
+[Read the tests](#testing) · [Understand the limits](#limits).
+
 Pageviews are a weak proxy for visitor interest, not a measure of attendance.
 The point of the project is not the metric. It is the ingest: what happens when
 a third-party API rate limits you, answers 404 for a quiet week, restates a
