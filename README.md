@@ -5,9 +5,10 @@
 Incremental ingest of daily Wikipedia pageviews for eight New Zealand visitor
 attractions, into DuckDB.
 
-This project keeps a local history of pageviews and updates only the dates
-that need attention. It demonstrates how a data import can recover from
-unreliable responses without silently leaving gaps or inserting duplicates.
+The implementation focuses on watermark correctness under partial responses,
+publication lag and restatements: retries and quarantine must not advance the
+ingestion frontier past unresolved data. The offline demo exercises incremental
+loading and duplicate prevention without a live API dependency.
 
 **Start here:** [Try the offline demo](#run-it) · [Inspect the stored tables](#tables) ·
 [Read the tests](#testing) · [Understand the limits](#limits).
