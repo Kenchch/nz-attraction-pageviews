@@ -1,0 +1,67 @@
+{
+  "items": [
+    {
+      "project": "en.wikipedia",
+      "article": "Te_Papa",
+      "granularity": "daily",
+      "timestamp": "2026082900",
+      "access": "all-access",
+      "agent": "user",
+      "views": 34
+    },
+    {
+      "project": "en.wikipedia",
+      "article": "Te_Papa",
+      "granularity": "daily",
+      "timestamp": "2026083000",
+      "access": "all-access",
+      "agent": "user",
+      "views": 51
+    },
+    {
+      "project": "en.wikipedia",
+      "article": "Te_Papa",
+      "granularity": "daily",
+      "timestamp": "2026083100",
+      "access": "all-access",
+      "agent": "user",
+      "views": 49
+    },
+    {
+      "project": "en.wikipedia",
+      "article": "Te_Papa",
+      "granularity": "daily",
+      "timestamp": "2026090100",
+      "access": "all-access",
+      "agent": "user",
+      "views": 51
+    },
+    {
+      "project": "en.wikipedia",
+      "article": "Te_Papa",
+      "granularity": "daily",
+      "timestamp": "2026090200",
+      "access": "all-access",
+      "agent": "user",
+      "views": 65
+    },
+    {
+      "project": "en.wikipedia",
+      "article": "Te_Papa",
+      "granularity": "daily",
+      "timestamp": "2026090300",
+      "access": "all-access",
+      "agent": "user",
+      "views": 67
+    },
+    {
+      "project": "en.wikipedia",
+      "article": "Te_Papa",
+      "granularity": "daily",
+      "timestamp": "2026090400",
+      "access": "all-access",
+      "agent": "user",
+      "views": 65
+    }
+  ]
+}

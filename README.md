@@ -68,3 +68,9 @@ python -m nz_attraction_pageviews resolve milford-sound 2026-02-01 --db warehous
 
 A recurrence reopens the issue. This command never moves the watermark or
 inserts a pageview. Existing historical duplicate records are preserved.
+
+A [live seven-day run](fixtures/live/run-log.json) on 2026-09-06 loaded 56 rows
+across all eight venues with zero rejects. Two captured API responses accompany
+that log. After installing the package, run `python scripts/capture_live.py` to
+capture fresh evidence. The network smoke test is opt-in:
+`RUN_LIVE=1 pytest -m live` (PowerShell: set `$env:RUN_LIVE='1'` first).

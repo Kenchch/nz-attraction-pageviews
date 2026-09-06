@@ -1,0 +1,67 @@
+{
+  "items": [
+    {
+      "project": "en.wikipedia",
+      "article": "Milford_Sound",
+      "granularity": "daily",
+      "timestamp": "2026082900",
+      "access": "all-access",
+      "agent": "user",
+      "views": 146
+    },
+    {
+      "project": "en.wikipedia",
+      "article": "Milford_Sound",
+      "granularity": "daily",
+      "timestamp": "2026083000",
+      "access": "all-access",
+      "agent": "user",
+      "views": 196
+    },
+    {
+      "project": "en.wikipedia",
+      "article": "Milford_Sound",
+      "granularity": "daily",
+      "timestamp": "2026083100",
+      "access": "all-access",
+      "agent": "user",
+      "views": 171
+    },
+    {
+      "project": "en.wikipedia",
+      "article": "Milford_Sound",
+      "granularity": "daily",
+      "timestamp": "2026090100",
+      "access": "all-access",
+      "agent": "user",
+      "views": 176
+    },
+    {
+      "project": "en.wikipedia",
+      "article": "Milford_Sound",
+      "granularity": "daily",
+      "timestamp": "2026090200",
+      "access": "all-access",
+      "agent": "user",
+      "views": 193
+    },
+    {
+      "project": "en.wikipedia",
+      "article": "Milford_Sound",
+      "granularity": "daily",
+      "timestamp": "2026090300",
+      "access": "all-access",
+      "agent": "user",
+      "views": 217
+    },
+    {
+      "project": "en.wikipedia",
+      "article": "Milford_Sound",
+      "granularity": "daily",
+      "timestamp": "2026090400",
+      "access": "all-access",
+      "agent": "user",
+      "views": 166
+    }
+  ]
+}

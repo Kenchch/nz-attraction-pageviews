@@ -1,0 +1,29 @@
+{
+  "captured_at_utc": "2026-09-06T05:21:17.497598+00:00",
+  "captures": [
+    {
+      "article": "Milford_Sound",
+      "url": "https://wikimedia.org/api/rest_v1/metrics/pageviews/per-article/en.wikipedia/all-access/user/Milford_Sound/daily/20260829/20260904",
+      "status": 200,
+      "file": "Milford_Sound.json"
+    },
+    {
+      "article": "Te_Papa",
+      "url": "https://wikimedia.org/api/rest_v1/metrics/pageviews/per-article/en.wikipedia/all-access/user/Te_Papa/daily/20260829/20260904",
+      "status": 200,
+      "file": "Te_Papa.json"
+    }
+  ],
+  "run_summary": {
+    "run_id": "af9463312ad0",
+    "status": "ok",
+    "venues": 8,
+    "requests": 8,
+    "rows_fetched": 56,
+    "rows_loaded": 56,
+    "rows_quarantined": 0,
+    "reject_rate": 0.0,
+    "note": ""
+  },
+  "storage": "fresh in-memory DuckDB; seven-day backfill across venues.csv"
+}

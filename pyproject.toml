@@ -21,6 +21,7 @@ packages = ["nz_attraction_pageviews"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = ["live: opt-in Wikimedia network smoke test"]
 # Put the project root on sys.path so `pytest` works, not just `python -m pytest`
 # (the -m form adds the working directory for you; the bare command does not).
 pythonpath = ["."]
