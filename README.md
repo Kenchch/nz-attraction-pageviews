@@ -48,7 +48,7 @@ The CLI prints operational notes as well as row counts.
 - Publication lag and genuinely quiet days remain ambiguous; the trust horizon is an assumption.
 - A settled watermark prevents historical restatements from being fetched automatically.
 - Requests are sequential; this is an eight-venue pipeline with no orchestrator.
-- Quarantine resolution and an automatic historical backfill sweep are not implemented.
+- Resolution annotations do not accept rows or advance watermarks; no automatic historical backfill sweep is implemented.
 
 ## Data
 
@@ -57,3 +57,14 @@ No API key is required. Set a contactable User-Agent in `client.py` before runni
 
 [Design notes, table schemas and detailed recovery evidence](docs/DESIGN.md) ·
 [HTTP isolation regression tests](tests/test_venue_failures.py)
+
+Repeated rejects are deduplicated by venue, date and rule; `rows_quarantined`
+in the run log counts rejected observations in that run, not new unique issues.
+Annotate a reviewed issue with:
+
+```bash
+python -m nz_attraction_pageviews resolve milford-sound 2026-02-01 --db warehouse.duckdb --resolution "Source reviewed"
+```
+
+A recurrence reopens the issue. This command never moves the watermark or
+inserts a pageview. Existing historical duplicate records are preserved.

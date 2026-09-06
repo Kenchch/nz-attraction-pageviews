@@ -646,7 +646,7 @@ def test_repeated_quarantine_of_one_day_is_countable_as_one_day(con):
     rows, bad_days = con.execute("""
         SELECT count(*), count(DISTINCT (venue_id, view_date)) FROM quarantine
     """).fetchone()
-    assert rows == 3
+    assert rows == 1
     assert bad_days == 1, "three runs, but still only one bad day"
 
 

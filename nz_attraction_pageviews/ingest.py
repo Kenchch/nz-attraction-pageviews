@@ -112,6 +112,8 @@ CREATE TABLE IF NOT EXISTS run_log (
 # lands at the end rather than in the middle where the DDL above puts it.
 MIGRATIONS = """
 ALTER TABLE quarantine ADD COLUMN IF NOT EXISTS view_date DATE;
+ALTER TABLE quarantine ADD COLUMN IF NOT EXISTS resolved_at TIMESTAMP;
+ALTER TABLE quarantine ADD COLUMN IF NOT EXISTS resolution VARCHAR;
 """
 
 
@@ -797,6 +799,45 @@ def _has_any_rows(con, venue_id: str) -> bool:
     return row is not None
 
 
+def _store_rejects(con, run_id: str, bad: list[quality.BadRow]) -> None:
+    """Keep one rejection per venue/day/rule, including malformed null dates.
+
+    The caller owns the transaction. Re-observation reopens a resolved issue;
+    the original rejection remains available for provenance.
+    """
+    already = set(con.execute("SELECT venue_id, view_date, rule FROM quarantine").fetchall())
+    now = utc_now()
+    for row in bad:
+        key = (row.venue_id, row.view_date, row.rule)
+        if key in already:
+            con.execute(
+                "UPDATE quarantine SET resolved_at = NULL, resolution = NULL "
+                "WHERE venue_id = ? AND view_date IS NOT DISTINCT FROM ? AND rule = ? "
+                "AND resolved_at IS NOT NULL",
+                key,
+            )
+            continue
+        con.execute(
+            "INSERT INTO quarantine "
+            "(run_id, venue_id, article, view_date, rule, detail, raw, seen_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            [run_id, row.venue_id, row.article, row.view_date, row.rule, row.detail, row.raw, now],
+        )
+        already.add(key)
+
+
+def resolve(con, venue_id: str, view_date: date, resolution: str) -> int:
+    """Annotate reviewed rejects without accepting data or advancing a watermark."""
+    if not resolution.strip():
+        raise ValueError("A resolution note is required")
+    rows = con.execute(
+        "UPDATE quarantine SET resolved_at = ?, resolution = ? "
+        "WHERE venue_id = ? AND view_date = ? AND resolved_at IS NULL RETURNING rule",
+        [utc_now(), resolution.strip(), venue_id, view_date],
+    ).fetchall()
+    return len(rows)
+
+
 def _quarantine_rejects(con, run_id, bad, summary, started_at) -> None:
     """The gate-abort counterpart of _load: rejects and the run log, nothing else.
 
@@ -805,28 +846,9 @@ def _quarantine_rejects(con, run_id, bad, summary, started_at) -> None:
     this existed that claim was false on every aborted run: the log said N and
     the table held nothing.
     """
-    now = utc_now()
-    # Only what is not already there. A stalled venue re-fetches the same window
-    # every night, so writing `bad` wholesale would add the same rejected day
-    # again on every one of them - the table would grow quadratically while
-    # `already` gained nothing, since it is a set on exactly this key.
-    already = {
-        (r[0], r[1], r[2])
-        for r in con.execute("SELECT venue_id, view_date, rule FROM quarantine").fetchall()
-    }
-    fresh = [r for r in bad if (r.venue_id, r.view_date, r.rule) not in already]
     try:
         con.execute("BEGIN TRANSACTION")
-        if fresh:
-            con.executemany(
-                "INSERT INTO quarantine "
-                "(run_id, venue_id, article, view_date, rule, detail, raw, seen_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                [
-                    (run_id, r.venue_id, r.article, r.view_date, r.rule, r.detail, r.raw, now)
-                    for r in fresh
-                ],
-            )
+        _store_rejects(con, run_id, bad)
         _write_run_log(con, summary, started_at)
         con.execute("COMMIT")
     except BaseException:
@@ -863,16 +885,7 @@ def _load(con, run_id, clean, bad, new_watermarks, summary, started_at) -> None:
                 "VALUES (?, ?, ?, ?, ?, ?)",
                 [(r.venue_id, r.article, r.view_date, r.views, run_id, now) for r in clean],
             )
-        if bad:
-            con.executemany(
-                "INSERT INTO quarantine "
-                "(run_id, venue_id, article, view_date, rule, detail, raw, seen_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                [
-                    (run_id, r.venue_id, r.article, r.view_date, r.rule, r.detail, r.raw, now)
-                    for r in bad
-                ],
-            )
+        _store_rejects(con, run_id, bad)
         if new_watermarks:
             con.executemany(
                 "INSERT OR REPLACE INTO watermark (venue_id, last_date, updated_at) "
