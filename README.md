@@ -342,14 +342,6 @@ missing column while tolerating a BOM and an extra column.
 
 CI runs lint, format check, and tests on Python 3.10 through 3.13.
 
-## How this was built
-
-Built with AI pair-programming (Claude Code and OpenAI Codex) for drafting,
-refactoring and test scaffolding. I set the problem, designed the ingestion and
-quarantine contracts, chose the quality rules, ran the checks, and reviewed and
-edited the code. Commits where an assistant contributed code retain a
-`Co-Authored-By` trailer.
-
 ## Limits
 
 - Pageviews measure interest, not attendance. Do not read them as visitor numbers.
