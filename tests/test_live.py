@@ -1,4 +1,5 @@
 """Network smoke test, enabled explicitly with RUN_LIVE=1 pytest -m live."""
+
 import os
 from datetime import date, timedelta
 

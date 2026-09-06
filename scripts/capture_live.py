@@ -2,6 +2,7 @@
 
 Run from the repository root: python scripts/capture_live.py
 """
+
 from __future__ import annotations
 
 import argparse
@@ -33,15 +34,20 @@ def main():
         captures.append({"article": article, "url": url, "status": status, "file": path.name})
     con = ingest.connect(":memory:")
     try:
-        summary = ingest.run(con, ingest.read_venues("venues.csv"), today=args.today,
-                             backfill_days=7, chunk_days=7)
+        summary = ingest.run(
+            con, ingest.read_venues("venues.csv"), today=args.today, backfill_days=7, chunk_days=7
+        )
     finally:
         con.close()
-    evidence = {"captured_at_utc": datetime.now(timezone.utc).isoformat(),
-                "captures": captures, "run_summary": asdict(summary),
-                "storage": "fresh in-memory DuckDB; seven-day backfill across venues.csv"}
+    evidence = {
+        "captured_at_utc": datetime.now(timezone.utc).isoformat(),
+        "captures": captures,
+        "run_summary": asdict(summary),
+        "storage": "fresh in-memory DuckDB; seven-day backfill across venues.csv",
+    }
     (args.output / "run-log.json").write_text(
-        json.dumps(evidence, indent=2, default=str) + "\n", encoding="utf-8")
+        json.dumps(evidence, indent=2, default=str) + "\n", encoding="utf-8"
+    )
     print(json.dumps(evidence, indent=2, default=str))
 
 
