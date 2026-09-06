@@ -112,6 +112,8 @@ CREATE TABLE IF NOT EXISTS run_log (
 # lands at the end rather than in the middle where the DDL above puts it.
 MIGRATIONS = """
 ALTER TABLE quarantine ADD COLUMN IF NOT EXISTS view_date DATE;
+ALTER TABLE quarantine ADD COLUMN IF NOT EXISTS resolved_at TIMESTAMP;
+ALTER TABLE quarantine ADD COLUMN IF NOT EXISTS resolution VARCHAR;
 """
 
 
@@ -393,6 +395,7 @@ def _fetch_all(
     stalled: list[str],
 ) -> tuple[list[Fetched], list[str]]:
     fetched: list[Fetched] = []
+    failures: list[str] = []
     for venue in venues:
         start = start_date_for(con, venue, end, backfill_days)
         if start < floor:
@@ -406,33 +409,42 @@ def _fetch_all(
         venue_clean: list[quality.CleanRow] = []
         venue_bad: list[quality.BadRow] = []
 
-        for window_start, window_end in plan_windows(start, end, chunk_days):
-            # Counted BEFORE the call. The failure path writes this summary
-            # to the run log, and incrementing afterwards meant the request
-            # that raised was never counted - so the one run whose request
-            # count matters read one short, and a venue that failed on its
-            # first window logged `requests 0` while having gone to the
-            # network. The field answers "how many windows did we ask for",
-            # which is decided when we ask, not when we get an answer.
-            summary.requests += 1
-            items = fetch(venue.wiki_article, window_start, window_end)
-            summary.rows_fetched += len(items)
+        try:
+            for window_start, window_end in plan_windows(start, end, chunk_days):
+                # Counted BEFORE the call. The failure path writes this summary
+                # to the run log, and incrementing afterwards meant the request
+                # that raised was never counted - so the one run whose request
+                # count matters read one short, and a venue that failed on its
+                # first window logged `requests 0` while having gone to the
+                # network. The field answers "how many windows did we ask for",
+                # which is decided when we ask, not when we get an answer.
+                summary.requests += 1
+                items = fetch(venue.wiki_article, window_start, window_end)
+                summary.rows_fetched += len(items)
 
-            good, rejected = quality.check_window(
-                items,
-                venue_id=venue.venue_id,
-                article=venue.wiki_article,
-                start=window_start,
-                end=window_end,
-                today=today,
-            )
-            venue_clean.extend(good)
-            venue_bad.extend(rejected)
+                good, rejected = quality.check_window(
+                    items,
+                    venue_id=venue.venue_id,
+                    article=venue.wiki_article,
+                    start=window_start,
+                    end=window_end,
+                    today=today,
+                )
+                venue_clean.extend(good)
+                venue_bad.extend(rejected)
+
+        except client.ApiError as exc:
+            note = f"{venue.venue_id}: {exc}; watermark held"
+            failures.append(note)
+            stalled.append(note)
+            continue
 
         clean.extend(venue_clean)
         bad.extend(venue_bad)
         fetched.append(Fetched(venue, start, venue_clean, venue_bad))
 
+    if failures and not fetched:
+        raise client.ApiError("All requested venues failed: " + "; ".join(failures))
     return fetched, stalled
 
 
@@ -610,27 +622,7 @@ def _apply_gate(
     # that venue is zero, it is no longer held, and it loads normally. That
     # self-healing path is the whole reason the per-venue test is on novel
     # rejections rather than raw ones.
-    gate_fetched = sum(
-        len(venue_clean) + len(venue_bad)
-        for venue, venue_clean, venue_bad in ((f.venue, f.clean, f.bad) for f in fetched)
-        if venue.venue_id not in held
-    )
-    gate_bad = [r for r in novel if r.venue_id not in held]
-
-    # The whole-run gate the per-venue test replaced cannot fire on its
-    # own. Every venue still in it is by construction at or under the
-    # ceiling, and a weighted mean of values under a ceiling is under that
-    # ceiling, so `enforce_gate` below is arithmetically unreachable. It is
-    # kept because it is the correct expression of "the surviving rows are
-    # acceptable" and costs nothing, but it is not what refuses a bad
-    # extract.
-    #
-    # "Is tonight's extract broadly bad" therefore has to be asked about
-    # VENUES rather than rows: one venue of eight is one bad venue, but
-    # most of them at once is one bad extract. `max_reject_rate` is a
-    # per-row ceiling and means nothing at this level, so this is a
-    # majority. Venues that answered with nothing at all are not counted -
-    # a quiet night is not a failed one.
+    # A majority of answering venues with new failures rejects the extract.
     answering = [f.venue.venue_id for f in fetched if f.clean or f.bad]
     if answering and len(held) * 2 > len(answering):
         raise quality.QualityGateFailed(
@@ -638,7 +630,6 @@ def _apply_gate(
             f"above the {max_reject_rate:.0%} ceiling - this is a bad "
             f"extract, not {len(held)} bad venues."
         )
-    quality.enforce_gate(gate_fetched, len(gate_bad), max_reject_rate)
 
     return held
 
@@ -670,7 +661,7 @@ def run(
     new_watermarks: dict[str, date] = {}
     stalled: list[str] = []
     silent: list[str] = []
-    fetched: list[tuple[Venue, date, list[quality.CleanRow], list[quality.BadRow]]] = []
+    fetched: list[Fetched] = []
 
     try:
         fetched, stalled = _fetch_all(
@@ -808,6 +799,45 @@ def _has_any_rows(con, venue_id: str) -> bool:
     return row is not None
 
 
+def _store_rejects(con, run_id: str, bad: list[quality.BadRow]) -> None:
+    """Keep one rejection per venue/day/rule, including malformed null dates.
+
+    The caller owns the transaction. Re-observation reopens a resolved issue;
+    the original rejection remains available for provenance.
+    """
+    already = set(con.execute("SELECT venue_id, view_date, rule FROM quarantine").fetchall())
+    now = utc_now()
+    for row in bad:
+        key = (row.venue_id, row.view_date, row.rule)
+        if key in already:
+            con.execute(
+                "UPDATE quarantine SET resolved_at = NULL, resolution = NULL "
+                "WHERE venue_id = ? AND view_date IS NOT DISTINCT FROM ? AND rule = ? "
+                "AND resolved_at IS NOT NULL",
+                key,
+            )
+            continue
+        con.execute(
+            "INSERT INTO quarantine "
+            "(run_id, venue_id, article, view_date, rule, detail, raw, seen_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            [run_id, row.venue_id, row.article, row.view_date, row.rule, row.detail, row.raw, now],
+        )
+        already.add(key)
+
+
+def resolve(con, venue_id: str, view_date: date, resolution: str) -> int:
+    """Annotate reviewed rejects without accepting data or advancing a watermark."""
+    if not resolution.strip():
+        raise ValueError("A resolution note is required")
+    rows = con.execute(
+        "UPDATE quarantine SET resolved_at = ?, resolution = ? "
+        "WHERE venue_id = ? AND view_date = ? AND resolved_at IS NULL RETURNING rule",
+        [utc_now(), resolution.strip(), venue_id, view_date],
+    ).fetchall()
+    return len(rows)
+
+
 def _quarantine_rejects(con, run_id, bad, summary, started_at) -> None:
     """The gate-abort counterpart of _load: rejects and the run log, nothing else.
 
@@ -816,28 +846,9 @@ def _quarantine_rejects(con, run_id, bad, summary, started_at) -> None:
     this existed that claim was false on every aborted run: the log said N and
     the table held nothing.
     """
-    now = utc_now()
-    # Only what is not already there. A stalled venue re-fetches the same window
-    # every night, so writing `bad` wholesale would add the same rejected day
-    # again on every one of them - the table would grow quadratically while
-    # `already` gained nothing, since it is a set on exactly this key.
-    already = {
-        (r[0], r[1], r[2])
-        for r in con.execute("SELECT venue_id, view_date, rule FROM quarantine").fetchall()
-    }
-    fresh = [r for r in bad if (r.venue_id, r.view_date, r.rule) not in already]
     try:
         con.execute("BEGIN TRANSACTION")
-        if fresh:
-            con.executemany(
-                "INSERT INTO quarantine "
-                "(run_id, venue_id, article, view_date, rule, detail, raw, seen_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                [
-                    (run_id, r.venue_id, r.article, r.view_date, r.rule, r.detail, r.raw, now)
-                    for r in fresh
-                ],
-            )
+        _store_rejects(con, run_id, bad)
         _write_run_log(con, summary, started_at)
         con.execute("COMMIT")
     except BaseException:
@@ -874,16 +885,7 @@ def _load(con, run_id, clean, bad, new_watermarks, summary, started_at) -> None:
                 "VALUES (?, ?, ?, ?, ?, ?)",
                 [(r.venue_id, r.article, r.view_date, r.views, run_id, now) for r in clean],
             )
-        if bad:
-            con.executemany(
-                "INSERT INTO quarantine "
-                "(run_id, venue_id, article, view_date, rule, detail, raw, seen_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                [
-                    (run_id, r.venue_id, r.article, r.view_date, r.rule, r.detail, r.raw, now)
-                    for r in bad
-                ],
-            )
+        _store_rejects(con, run_id, bad)
         if new_watermarks:
             con.executemany(
                 "INSERT OR REPLACE INTO watermark (venue_id, last_date, updated_at) "

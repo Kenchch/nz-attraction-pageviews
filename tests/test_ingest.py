@@ -646,7 +646,7 @@ def test_repeated_quarantine_of_one_day_is_countable_as_one_day(con):
     rows, bad_days = con.execute("""
         SELECT count(*), count(DISTINCT (venue_id, view_date)) FROM quarantine
     """).fetchone()
-    assert rows == 3
+    assert rows == 1
     assert bad_days == 1, "three runs, but still only one bad day"
 
 
@@ -1129,7 +1129,7 @@ def test_a_request_that_raises_is_still_counted(con):
         "SELECT status, requests FROM run_log ORDER BY started_at DESC LIMIT 1"
     ).fetchone()
     assert status == "failed"
-    assert requests == 1, "the request that raised was not counted"
+    assert requests == len(VENUES), "each failed venue request must be counted"
 
 
 @pytest.mark.parametrize("cancellation", [KeyboardInterrupt, SystemExit])

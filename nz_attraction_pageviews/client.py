@@ -34,7 +34,10 @@ ACCESS = "all-access"
 AGENT = "user"
 
 # Wikimedia asks for a contactable User-Agent. An anonymous one gets throttled.
-USER_AGENT = "nz-attraction-pageviews/0.1 (https://github.com/Kenchch/nz-attraction-pageviews)"
+USER_AGENT = (
+    "nz-attraction-pageviews/0.1 "
+    "(https://github.com/Kenchch/nz-attraction-pageviews; mailto:janfinq@gmail.com)"
+)
 
 # The fields we agreed to consume. Extra fields are fine, missing ones are not.
 EXPECTED_FIELDS = frozenset(

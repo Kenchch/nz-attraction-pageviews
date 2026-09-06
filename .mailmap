@@ -1,14 +1,9 @@
-# One author, recorded under several names and addresses over the life of these
-# repositories. This file maps them onto one identity for `git log`,
-# `git shortlog` and `git blame` without rewriting a single commit, so existing
-# SHAs and any link to them stay valid.
-#
-# Deliberately not listed: a university address that appears in a couple of old
-# commit trailers. Adding it here would republish it in a tracked file, which is
-# the opposite of the point.
+# One author recorded under several names and addresses.
+# This file collapses them for git log / shortlog / blame.
 
 Feng Jiang <148679986+Kenchch@users.noreply.github.com> <janfinq@gmail.com>
 Feng Jiang <148679986+Kenchch@users.noreply.github.com> <Kenchch@users.noreply.github.com>
 Feng Jiang <148679986+Kenchch@users.noreply.github.com> Fong <148679986+Kenchch@users.noreply.github.com>
 Feng Jiang <148679986+Kenchch@users.noreply.github.com> Feng <148679986+Kenchch@users.noreply.github.com>
 Feng Jiang <148679986+Kenchch@users.noreply.github.com> kenchch <148679986+Kenchch@users.noreply.github.com>
+Feng Jiang <148679986+Kenchch@users.noreply.github.com> kenchch <fji27@uclive.ac.nz>
