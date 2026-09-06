@@ -74,3 +74,11 @@ across all eight venues with zero rejects. Two captured API responses accompany
 that log. After installing the package, run `python scripts/capture_live.py` to
 capture fresh evidence. The network smoke test is opt-in:
 `RUN_LIVE=1 pytest -m live` (PowerShell: set `$env:RUN_LIVE='1'` first).
+
+## How this was built
+
+I set the problem, the data contracts and the quality rules, ran the benchmarks
+and reviewed every diff; Claude Code and OpenAI Codex drafted code, refactored
+and scaffolded tests. The full note — including the `Co-Authored-By` trailers
+removed from this repository's history on 6 September 2026 — is on my profile:
+[How I use AI tools](https://github.com/Kenchch/Kenchch#how-i-use-ai-tools).
