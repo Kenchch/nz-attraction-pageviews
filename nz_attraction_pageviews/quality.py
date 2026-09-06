@@ -12,6 +12,7 @@ Two decisions worth defending in a review:
 
 from __future__ import annotations
 
+import json
 import re
 import unicodedata
 from dataclasses import dataclass
@@ -92,7 +93,16 @@ def check_window(
         )
         if broken is not None:
             rule, detail = broken
-            bad.append(BadRow(venue_id, article, _date_or_none(item), rule, detail, repr(item)))
+            bad.append(
+                BadRow(
+                    venue_id,
+                    article,
+                    _date_or_none(item),
+                    rule,
+                    detail,
+                    json.dumps(item, ensure_ascii=False),
+                )
+            )
             continue
 
         view_date = parse_timestamp(item["timestamp"])

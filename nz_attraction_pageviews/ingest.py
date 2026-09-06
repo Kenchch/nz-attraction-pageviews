@@ -393,6 +393,7 @@ def _fetch_all(
     stalled: list[str],
 ) -> tuple[list[Fetched], list[str]]:
     fetched: list[Fetched] = []
+    failures: list[str] = []
     for venue in venues:
         start = start_date_for(con, venue, end, backfill_days)
         if start < floor:
@@ -406,33 +407,42 @@ def _fetch_all(
         venue_clean: list[quality.CleanRow] = []
         venue_bad: list[quality.BadRow] = []
 
-        for window_start, window_end in plan_windows(start, end, chunk_days):
-            # Counted BEFORE the call. The failure path writes this summary
-            # to the run log, and incrementing afterwards meant the request
-            # that raised was never counted - so the one run whose request
-            # count matters read one short, and a venue that failed on its
-            # first window logged `requests 0` while having gone to the
-            # network. The field answers "how many windows did we ask for",
-            # which is decided when we ask, not when we get an answer.
-            summary.requests += 1
-            items = fetch(venue.wiki_article, window_start, window_end)
-            summary.rows_fetched += len(items)
+        try:
+            for window_start, window_end in plan_windows(start, end, chunk_days):
+                # Counted BEFORE the call. The failure path writes this summary
+                # to the run log, and incrementing afterwards meant the request
+                # that raised was never counted - so the one run whose request
+                # count matters read one short, and a venue that failed on its
+                # first window logged `requests 0` while having gone to the
+                # network. The field answers "how many windows did we ask for",
+                # which is decided when we ask, not when we get an answer.
+                summary.requests += 1
+                items = fetch(venue.wiki_article, window_start, window_end)
+                summary.rows_fetched += len(items)
 
-            good, rejected = quality.check_window(
-                items,
-                venue_id=venue.venue_id,
-                article=venue.wiki_article,
-                start=window_start,
-                end=window_end,
-                today=today,
-            )
-            venue_clean.extend(good)
-            venue_bad.extend(rejected)
+                good, rejected = quality.check_window(
+                    items,
+                    venue_id=venue.venue_id,
+                    article=venue.wiki_article,
+                    start=window_start,
+                    end=window_end,
+                    today=today,
+                )
+                venue_clean.extend(good)
+                venue_bad.extend(rejected)
+
+        except client.ApiError as exc:
+            note = f"{venue.venue_id}: {exc}; watermark held"
+            failures.append(note)
+            stalled.append(note)
+            continue
 
         clean.extend(venue_clean)
         bad.extend(venue_bad)
         fetched.append(Fetched(venue, start, venue_clean, venue_bad))
 
+    if failures and not fetched:
+        raise client.ApiError("All requested venues failed: " + "; ".join(failures))
     return fetched, stalled
 
 
@@ -610,27 +620,7 @@ def _apply_gate(
     # that venue is zero, it is no longer held, and it loads normally. That
     # self-healing path is the whole reason the per-venue test is on novel
     # rejections rather than raw ones.
-    gate_fetched = sum(
-        len(venue_clean) + len(venue_bad)
-        for venue, venue_clean, venue_bad in ((f.venue, f.clean, f.bad) for f in fetched)
-        if venue.venue_id not in held
-    )
-    gate_bad = [r for r in novel if r.venue_id not in held]
-
-    # The whole-run gate the per-venue test replaced cannot fire on its
-    # own. Every venue still in it is by construction at or under the
-    # ceiling, and a weighted mean of values under a ceiling is under that
-    # ceiling, so `enforce_gate` below is arithmetically unreachable. It is
-    # kept because it is the correct expression of "the surviving rows are
-    # acceptable" and costs nothing, but it is not what refuses a bad
-    # extract.
-    #
-    # "Is tonight's extract broadly bad" therefore has to be asked about
-    # VENUES rather than rows: one venue of eight is one bad venue, but
-    # most of them at once is one bad extract. `max_reject_rate` is a
-    # per-row ceiling and means nothing at this level, so this is a
-    # majority. Venues that answered with nothing at all are not counted -
-    # a quiet night is not a failed one.
+    # A majority of answering venues with new failures rejects the extract.
     answering = [f.venue.venue_id for f in fetched if f.clean or f.bad]
     if answering and len(held) * 2 > len(answering):
         raise quality.QualityGateFailed(
@@ -638,7 +628,6 @@ def _apply_gate(
             f"above the {max_reject_rate:.0%} ceiling - this is a bad "
             f"extract, not {len(held)} bad venues."
         )
-    quality.enforce_gate(gate_fetched, len(gate_bad), max_reject_rate)
 
     return held
 
@@ -670,7 +659,7 @@ def run(
     new_watermarks: dict[str, date] = {}
     stalled: list[str] = []
     silent: list[str] = []
-    fetched: list[tuple[Venue, date, list[quality.CleanRow], list[quality.BadRow]]] = []
+    fetched: list[Fetched] = []
 
     try:
         fetched, stalled = _fetch_all(

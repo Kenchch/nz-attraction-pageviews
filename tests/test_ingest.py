@@ -1129,7 +1129,7 @@ def test_a_request_that_raises_is_still_counted(con):
         "SELECT status, requests FROM run_log ORDER BY started_at DESC LIMIT 1"
     ).fetchone()
     assert status == "failed"
-    assert requests == 1, "the request that raised was not counted"
+    assert requests == len(VENUES), "each failed venue request must be counted"
 
 
 @pytest.mark.parametrize("cancellation", [KeyboardInterrupt, SystemExit])

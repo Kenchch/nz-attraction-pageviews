@@ -7,7 +7,10 @@ name = "nz-attraction-pageviews"
 version = "0.1.0"
 description = "Incremental API ingest of Wikipedia pageviews for NZ visitor attractions"
 requires-python = ">=3.10"
-dependencies = ["duckdb>=1.0"]
+dependencies = ["duckdb>=1.0,<2"]
+
+[project.optional-dependencies]
+dev = ["pytest>=8,<10", "ruff>=0.16,<0.17"]
 
 # Named explicitly rather than left to auto-discovery. When the package was a
 # directory called `src`, setuptools read it as a src-layout root and built a
