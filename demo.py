@@ -56,7 +56,7 @@ def main() -> None:
             con, venues, today=day, backfill_days=90, chunk_days=30, fetch=synthetic_api
         )
         print(
-            f"{label:26} {summary.status:6} "
+            f"{label:26} {summary.status:9} "
             f"requests={summary.requests:<3} fetched={summary.rows_fetched:<4} "
             f"loaded={summary.rows_loaded:<4} quarantined={summary.rows_quarantined}"
         )

@@ -5,9 +5,13 @@ Two decisions worth defending in a review:
 - A row that breaks a rule is quarantined, not dropped. The row keeps the name
   of the rule it broke, so "why is Tuesday missing" is answerable from a table
   rather than from a log file that has rotated away.
-- The gate is checked before anything is written. If today's extract is bad,
-  last night's data stays intact. A partial load is worse than no load, because
-  it looks fine on a dashboard.
+- The gate is checked before anything is written, and it is checked per venue.
+  A venue whose newly rejected days are over the ceiling is held: its watermark
+  stays put and nothing of it is loaded, so last night's data for it stays
+  intact. Held venues do not block the others -- a partial run is better than no
+  run, because every venue's own watermark already refuses to step over the days
+  it has not resolved. A run carrying any unresolved rejection is reported as
+  `degraded` rather than `ok`.
 """
 
 from __future__ import annotations
@@ -213,14 +217,3 @@ def reject_rate(fetched: int, quarantined: int) -> float:
     if fetched == 0:
         return 0.0
     return quarantined / fetched
-
-
-def enforce_gate(fetched: int, quarantined: int, max_reject_rate: float) -> float:
-    """Raise if too much of the run was rejected. Returns the rate when it passes."""
-    rate = reject_rate(fetched, quarantined)
-    if rate > max_reject_rate:
-        raise QualityGateFailed(
-            f"rejected {quarantined}/{fetched} rows ({rate:.2%}), "
-            f"above the {max_reject_rate:.2%} threshold. Nothing was loaded."
-        )
-    return rate
