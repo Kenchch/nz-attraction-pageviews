@@ -36,8 +36,8 @@ pytest -q                          # offline; network calls are stubbed
 `demo.py` output:
 
 ```
-run 1 (first sight)        ok     requests=24  fetched=720  loaded=720  quarantined=0
-run 2 (three days later)   ok     requests=8   fetched=24   loaded=24   quarantined=0
+run 1 (first sight)        ok        requests=24  fetched=720  loaded=720  quarantined=0
+run 2 (three days later)   ok        requests=8   fetched=24   loaded=24   quarantined=0
 
 744 rows, 0 duplicate (venue, date) pairs
 ```
@@ -213,49 +213,57 @@ about days this run requested, and it passed that one long ago. Stopping for it
 would neither recover the day nor stop happening. The cost of all this is that
 every venue re-asks for its last few days each night.
 
-**5. The gate runs before the load, not after.**
-If more than 5% of a run is *newly* rejected, nothing is written and last
-night's data stays intact. A partial load is worse than no load, because a
-partial load still renders on a dashboard and looks fine.
+**5. A bad venue is held. A bad extract is not a thing the run decides.**
+If a venue's *newly* rejected share is over 5%, that venue is **held**: its
+clean rows are dropped, its watermark stays put, its rejected rows still go to
+`quarantine`, and it is named in `run_log.note`. The other venues load. A
+partial run is better than no run, because decision 4 already refuses to let any
+venue step over a day it did not load.
 
-Two words there carry the weight, and both were learned the hard way.
+Three words there carry the weight, and all three were learned the hard way.
 
 *Newly.* A day already sitting in `quarantine` for the same rule cannot be lost
 a second time — decision 4 is already holding the watermark short of it. Counted
-again every night, it pins the rate at a value nothing dilutes.
+again, it is worse than useless: once the watermark stops before a permanently
+bad day, the next window *starts* at that day, so it is 1 of 1 rejected, 100%,
+over any ceiling. One bad day would hold the venue for ever and stop its good
+days loading, for a fault that costs exactly one day.
 
-*Per venue, then globally.* The gate was a single whole-run rate, on the
-reasoning that at eight venues a per-venue rate is one or two rows and a single
-bad row reads as 100%. But a whole-run rate is **scale-invariant to a whole
-venue failing**: one venue of eight rejecting everything is 1/8 = 12.5% against
-a 5% ceiling, whatever the range length and however many venues are added.
-Measured with one venue whose title had drifted so the API answered 200 with a
-different article, the gate tripped every night, nothing loaded, no watermark
-moved, and the seven healthy venues stored **zero rows** — indefinitely. Once
-the oldest held day passed `max_lookback_days`, all eight would have given up on
-it together. One silent redirect upstream cost the whole warehouse.
+*Per venue.* The gate was a single whole-run rate, on the reasoning that at
+eight venues a per-venue rate is one or two rows and a single bad row reads as
+100%. But a whole-run rate is **scale-invariant to a whole venue failing**: one
+venue of eight rejecting everything is 1/8 = 12.5% against a 5% ceiling,
+whatever the range length and however many venues are added. Measured with one
+venue whose title had drifted so the API answered 200 with a different article,
+the gate tripped every night, nothing loaded, no watermark moved, and the seven
+healthy venues stored **zero rows** — indefinitely.
 
-So a venue whose own *newly* rejected share is over the ceiling is **held**,
-and held means held: its clean rows are dropped, its watermark stays put, its
-rejected rows still go to `quarantine`, and it is named in `run_log.note`.
-Loading a held venue's surviving rows would be the worst of both — the run gate
-could no longer refuse the extract, and `INSERT OR REPLACE` would write those
-rows over days the warehouse already held from a good run. Every day it covered
-is simply asked for again next run.
+*Held, not refused.* The whole-run gate survived that as a majority rule: one of
+eight is a bad venue, five of eight is a bad extract, and a bad extract was
+refused outright. The reasoning was sound and the consequence was not. Measured
+with five of eight venues drifting permanently: **the three healthy venues
+loaded nothing on nights 1 through 19**, because the abort raised before the
+load and so wrote no `quarantine` either — every night looked like the first.
+From night 20, once quarantine had finally filled by another route, every run
+reported `ok` with all five venues still broken. Nineteen dark nights and then a
+green light over a standing fault.
 
-It heals itself. Those rejected rows are in `quarantine` by the next run, so
-they are no longer *novel*, the venue drops out of `held`, and it loads
-normally — which is why the per-venue test is on new rejections rather than
-raw ones.
+So there is no whole-run refusal any more. Holding is per venue and that is the
+whole decision.
 
-**The broad-failure question is asked about venues, not rows.** Once the held
-venues are excluded, every venue left is by construction at or under the
-ceiling, and a weighted mean of values under a ceiling is under that ceiling —
-so a row-rate gate over the survivors is arithmetically unreachable. One venue
-of eight is one bad venue; a majority of the venues that answered is one bad
-extract, and that is what refuses it. Decision 4 is what makes all of it safe —
-the run continues, but no venue advances past a day it did not load.
+**What replaced the "bad extract" signal is the status, not a refusal.** A run
+is `degraded` rather than `ok` if any venue is held tonight *or* is still parked
+behind an unresolved rejection from an earlier night, and the note names them.
+That is the half the old rule got right — a standing problem must not read as a
+clean night — carried by the field that can say so without throwing away seven
+good venues to report one bad one.
 
+**Nothing heals itself, and that is deliberate.** A venue stops being *held* on
+the next run, because its rejections are no longer novel, so its clean days load
+again. Its watermark is still parked behind the unresolved day and the run still
+reports `degraded`. `resolve <venue> <date> --accept` is the way out: it records
+that the day is never arriving, and only then may the watermark step over it. A
+decision somebody makes, rather than one the code makes by forgetting.
 **6. The load is one transaction, and re-running is free.**
 `pageviews` is keyed on `(venue_id, view_date)` and loaded with
 `INSERT OR REPLACE`, so a restated figure overwrites rather than duplicates, and

@@ -21,7 +21,8 @@ in DuckDB. For readers studying reliable API ingestion and recovery from missing
 | HTTP errors | Retry transient failures; isolate failed venues; fail if all requested venues fail |
 | Schema drift | Abort the entire run when the response contract changes |
 | Watermarks | Hold at unresolved rejected or unpublished days |
-| Quality gate | Refuse new failures; standing problems remain in the run log and hold the watermark |
+| Quality gate | Hold the venue, not the run; a night with anything unresolved is `degraded`, never `ok` |
+| Releasing a hold | `resolve <venue> <date> --accept` records that a day is never arriving, so the watermark may pass it |
 | Idempotence | Re-requested days are overwritten; days behind settled watermarks are not re-fetched |
 
 The offline demo loads 720 rows, then 24 new rows on a run three days later:

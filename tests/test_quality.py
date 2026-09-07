@@ -106,19 +106,6 @@ def test_reject_rate_is_available_without_the_gate():
     assert quality.reject_rate(fetched=0, quarantined=0) == 0.0
 
 
-def test_gate_passes_under_threshold():
-    assert quality.enforce_gate(fetched=100, quarantined=3, max_reject_rate=0.05) == 0.03
-
-
-def test_gate_fails_over_threshold():
-    with pytest.raises(quality.QualityGateFailed, match="Nothing was loaded"):
-        quality.enforce_gate(fetched=100, quarantined=9, max_reject_rate=0.05)
-
-
-def test_gate_handles_empty_run():
-    assert quality.enforce_gate(fetched=0, quarantined=0, max_reject_rate=0.05) == 0.0
-
-
 def test_zero_views_is_clean_not_quarantined():
     """A day the API does report as zero is data, not a defect."""
     clean, bad = check([item(views=0)])
@@ -188,11 +175,6 @@ def test_the_first_rule_reported_is_the_root_cause():
     assert bad[0].rule == "date_in_requested_window"
 
 
-def test_a_rate_exactly_on_the_threshold_passes():
-    """The boundary the gate is written to allow: `>` not `>=`."""
-    assert quality.enforce_gate(fetched=100, quarantined=5, max_reject_rate=0.05) == 0.05
-
-
 def test_a_non_string_article_is_quarantined_not_raised():
     """`_parse` checks the field is present, never its type, so a drifted null or
     number reaches the comparison. Raising there would abort the load for every
@@ -232,3 +214,21 @@ def test_only_a_daily_timestamp_is_accepted(timestamp, ok):
     else:
         with pytest.raises(ValueError, match="YYYYMMDD00"):
             quality.parse_timestamp(timestamp)
+
+
+def test_reject_rate_is_the_fraction_rejected():
+    """`enforce_gate` used to live here and raise on the whole run's rate.
+
+    It went with the whole-run abort. The decision is per venue now and lives in
+    ingest._apply_gate, which compares this rate against the ceiling for one
+    venue's rows; the tests for that behaviour are in tests/test_ingest.py and
+    tests/test_gate_duration.py. What is left here is the arithmetic.
+    """
+    assert quality.reject_rate(fetched=100, quarantined=3) == 0.03
+    assert quality.reject_rate(fetched=100, quarantined=9) == 0.09
+    assert quality.reject_rate(fetched=100, quarantined=5) == 0.05
+
+
+def test_reject_rate_of_an_empty_run_is_zero():
+    """No rows fetched is not "everything was rejected"; it is nothing to judge."""
+    assert quality.reject_rate(fetched=0, quarantined=0) == 0.0

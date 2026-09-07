@@ -16,7 +16,6 @@ the other five.
 
 from __future__ import annotations
 
-import collections
 import csv
 import math
 import uuid
@@ -284,6 +283,7 @@ def _venue_watermark(
     venue_clean: list[quality.CleanRow],
     venue_bad: list[quality.BadRow],
     trusted_end: date | None,
+    accepted: set[date] | None = None,
 ) -> date | None:
     """How far this venue may advance. None means leave the watermark alone.
 
@@ -325,7 +325,16 @@ def _venue_watermark(
     # watermark passed that day runs ago; stopping for it permanently neither
     # recovers the day nor stops recurring, and would leave the venue re-fetching
     # its whole range every night until it hit the lookback cap.
-    in_window = [row.view_date for row in venue_bad if start <= row.view_date <= end]
+    # A day the operator has accepted is not a day this run failed to deal
+    # with; it is a day dealt with by deciding it is never coming. Without this
+    # the hold is a dead end: the venue rejects the same day for ever and the
+    # watermark can never step over it, which is why `resolve --accept` exists.
+    accepted = accepted or set()
+    in_window = [
+        row.view_date
+        for row in venue_bad
+        if start <= row.view_date <= end and row.view_date not in accepted
+    ]
     ceiling = min(in_window) - timedelta(days=1) if in_window else end
 
     loaded = [row.view_date for row in venue_clean]
@@ -460,7 +469,14 @@ def _advance_watermarks(
     new_watermarks: dict[str, date] = {}
     for f in fetched:
         venue, start, venue_clean, venue_bad = f.venue, f.start, f.clean, f.bad
-        frontier = _venue_watermark(start, end, venue_clean, venue_bad, trusted_end)
+        frontier = _venue_watermark(
+            start,
+            end,
+            venue_clean,
+            venue_bad,
+            trusted_end,
+            accepted=accepted_days(con, venue.venue_id),
+        )
         # Never move a watermark backwards. A venue already current past the
         # trust line would otherwise be dragged back to it and re-fetch the
         # same days every night.
@@ -570,11 +586,11 @@ def _apply_gate(
     novel = [r for r in bad if (r.venue_id, r.view_date, r.rule) not in already]
 
     if len(novel) != len(bad):
-        # Otherwise the log shows a rate above the ceiling on a run that
-        # passed, and nothing says why.
+        # Otherwise the log shows a rate above the ceiling and nothing says
+        # how much of it is a standing problem rather than tonight's. The gate
+        # itself counts raw rejections, so this is reporting, not arithmetic.
         silent.append(
-            f"{len(bad) - len(novel)} of {len(bad)} rejected rows were "
-            f"already quarantined; gate saw {len(novel)}"
+            f"{len(bad) - len(novel)} of {len(bad)} rejected rows were already quarantined"
         )
 
     # ... and it fires per VENUE before it fires globally.
@@ -595,18 +611,38 @@ def _apply_gate(
     # its own bad day it would hold all of them and deadlock exactly as
     # before. Nothing is NEWLY wrong with such a venue; the standing
     # problem is what run_log.note reports.
-    novel_by_venue = collections.Counter(r.venue_id for r in novel)
+    # Novel rejections decide the HOLD; outstanding ones decide the STATUS.
+    #
+    # Holding on raw rejections looks stricter and is wrong for the commonest
+    # shape. Once the watermark stops before a permanently bad day, the next
+    # window starts at that day, so it is 1 of 1 rejected -- 100%, held for
+    # ever, and its clean days stop loading too. A single bad day must be
+    # blocked by the watermark, not by the gate.
+    #
+    # Novel-only was blamed for the run going green while venues were still
+    # broken. It was not the cause. The whole-run abort was: it raised before
+    # _load, so `quarantine` stayed empty, every night looked like the first,
+    # and the healthy venues were refused with the broken ones. Measured, five
+    # of eight drifting: nights 1-19 loaded nothing at all, then `ok` from night
+    # 20 once quarantine finally filled.
+    #
+    # With the abort gone, novel does the job it was meant to do, and the "went
+    # green" half is fixed where it belongs -- in the status, which now reports
+    # any venue still carrying an unresolved rejection.
+
     held = set()
     for f in fetched:
         venue, venue_clean, venue_bad = f.venue, f.clean, f.bad
+        accepted = accepted_days(con, venue.venue_id)
         seen = len(venue_clean) + len(venue_bad)
-        fresh = novel_by_venue.get(venue.venue_id, 0)
+        fresh = sum(
+            1 for r in novel if r.venue_id == venue.venue_id and r.view_date not in accepted
+        )
         if seen and quality.reject_rate(seen, fresh) > max_reject_rate:
             held.add(venue.venue_id)
             silent.append(
                 f"{venue.venue_id}: {fresh}/{seen} newly rejected, above the ceiling, held"
             )
-
     # Holding a venue has to mean holding it. Excluding it from the gate
     # while still loading its rows was the worst of both: the whole-run
     # gate could no longer refuse the extract, and `INSERT OR REPLACE`
@@ -617,20 +653,11 @@ def _apply_gate(
     # Its clean rows are dropped and its watermark stays put, so every day
     # it covered is asked for again next run.
     #
-    # `bad` is deliberately untouched: the venue's rejected rows still
-    # reach `quarantine`, so next run they are in `already`, `novel` for
-    # that venue is zero, it is no longer held, and it loads normally. That
-    # self-healing path is the whole reason the per-venue test is on novel
-    # rejections rather than raw ones.
-    # A majority of answering venues with new failures rejects the extract.
-    answering = [f.venue.venue_id for f in fetched if f.clean or f.bad]
-    if answering and len(held) * 2 > len(answering):
-        raise quality.QualityGateFailed(
-            f"{len(held)} of {len(answering)} venues that answered rejected "
-            f"above the {max_reject_rate:.0%} ceiling - this is a bad "
-            f"extract, not {len(held)} bad venues."
-        )
-
+    # `bad` is deliberately untouched: the venue's rejected rows still reach
+    # `quarantine`, which is what an operator reads before deciding. A venue
+    # that stays broken stays held -- there is no self-heal any more, and that
+    # is the point: `resolve --accept` is the way out, and it is a decision
+    # somebody makes rather than one the code makes by forgetting.
     return held
 
 
@@ -732,7 +759,29 @@ def run(
 
         # Set before the load, because the load is what writes the run log now.
         summary.rows_loaded = len(clean)
-        summary.status = "ok"
+        # `ok` has to mean the warehouse is current, not merely that tonight
+        # added no NEW problems. A venue held tonight, and a venue whose
+        # watermark is still parked behind an unresolved rejection from an
+        # earlier night, are both reasons a reader should not trust the table to
+        # be complete -- and the second one is what used to report `ok`.
+        #
+        # Measured on the rule this replaces, five of eight venues drifting:
+        # nights 1-19 refused the whole extract, then every night from 20 said
+        # `ok` while all five were still stuck.
+        blocked = {
+            row[0]
+            for row in con.execute(
+                "SELECT DISTINCT venue_id FROM quarantine "
+                "WHERE view_date IS NOT NULL AND resolution IS DISTINCT FROM ?",
+                [ACCEPTED],
+            ).fetchall()
+        }
+        unresolved = held | blocked
+        if unresolved:
+            summary.note = "; ".join(
+                [*stalled, *silent, f"unresolved: {', '.join(sorted(unresolved))}"]
+            )
+        summary.status = "degraded" if unresolved else "ok"
         _load(con, run_id, clean, bad, new_watermarks, summary, started_at)
 
     except Exception as exc:
@@ -811,9 +860,14 @@ def _store_rejects(con, run_id: str, bad: list[quality.BadRow]) -> None:
         key = (row.venue_id, row.view_date, row.rule)
         if key in already:
             con.execute(
+                # An accepted day stays accepted. Re-observing it is expected --
+                # the API keeps answering the same way -- so reopening it would
+                # undo the decision on the next run and put the venue straight
+                # back into the dead end.
                 "UPDATE quarantine SET resolved_at = NULL, resolution = NULL "
                 "WHERE venue_id = ? AND view_date IS NOT DISTINCT FROM ? AND rule = ? "
-                "AND resolved_at IS NOT NULL",
+                "AND resolved_at IS NOT NULL "
+                "AND resolution IS DISTINCT FROM 'accepted'",
                 key,
             )
             continue
@@ -826,16 +880,57 @@ def _store_rejects(con, run_id: str, bad: list[quality.BadRow]) -> None:
         already.add(key)
 
 
-def resolve(con, venue_id: str, view_date: date, resolution: str) -> int:
-    """Annotate reviewed rejects without accepting data or advancing a watermark."""
+ACCEPTED = "accepted"
+
+
+def resolve(con, venue_id: str, view_date: date | None, resolution: str) -> int:
+    """Record a decision about quarantined days.
+
+    Two kinds of decision, because they have different consequences.
+
+    A note ("reviewed", "chased upstream") is annotation. The day stays a hard
+    stop: the watermark still refuses to step over it, because the data is
+    still missing and the quarantine is still a record of that.
+
+    `accepted` is the operator saying the day is never coming. Holding a venue
+    is per venue now, so a title that drifted permanently is held permanently
+    and nothing heals it on its own -- that is the correct behaviour for the
+    other seven venues, and a dead end for this one. Accepting is the way out:
+    the watermark may step over an accepted day, so the venue starts moving
+    again and stops rejecting the same window every night.
+
+    `view_date=None` addresses the rows a `timestamp_parses` failure left with
+    no day at all, which were previously unresolvable.
+    """
     if not resolution.strip():
         raise ValueError("A resolution note is required")
-    rows = con.execute(
-        "UPDATE quarantine SET resolved_at = ?, resolution = ? "
-        "WHERE venue_id = ? AND view_date = ? AND resolved_at IS NULL RETURNING rule",
-        [utc_now(), resolution.strip(), venue_id, view_date],
-    ).fetchall()
+    if view_date is None:
+        rows = con.execute(
+            "UPDATE quarantine SET resolved_at = ?, resolution = ? "
+            "WHERE venue_id = ? AND view_date IS NULL AND resolved_at IS NULL "
+            "RETURNING rule",
+            [utc_now(), resolution.strip(), venue_id],
+        ).fetchall()
+    else:
+        rows = con.execute(
+            "UPDATE quarantine SET resolved_at = ?, resolution = ? "
+            "WHERE venue_id = ? AND view_date = ? AND resolved_at IS NULL "
+            "RETURNING rule",
+            [utc_now(), resolution.strip(), venue_id, view_date],
+        ).fetchall()
     return len(rows)
+
+
+def accepted_days(con, venue_id: str) -> set[date]:
+    """Days an operator has accepted as never arriving, for this venue."""
+    return {
+        row[0]
+        for row in con.execute(
+            "SELECT DISTINCT view_date FROM quarantine "
+            "WHERE venue_id = ? AND resolution = ? AND view_date IS NOT NULL",
+            [venue_id, ACCEPTED],
+        ).fetchall()
+    }
 
 
 def _quarantine_rejects(con, run_id, bad, summary, started_at) -> None:
