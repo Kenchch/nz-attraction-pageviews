@@ -1,0 +1,10 @@
+# Let git normalise text in the repository and check it out in the platform
+# convention, so a clone on Windows and a clone on Linux hold the same bytes.
+* text=auto
+
+# Binary assets -- never diff these and never touch their line endings.
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.pdf binary
