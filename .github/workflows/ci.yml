@@ -8,6 +8,13 @@ on:
 permissions:
   contents: read
 
+# One run per ref: a second push while the first is still going wastes a
+# runner on a commit nobody is waiting for any more, and on a matrix this
+# wide that is several.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   test:
     runs-on: ubuntu-latest
