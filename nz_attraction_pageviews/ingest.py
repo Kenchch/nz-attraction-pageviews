@@ -10,7 +10,9 @@ Shape of a run:
       -> hold any venue whose NEW rejections are over the ceiling
       -> load: rows, quarantine, watermarks, status, run log       (one transaction)
 
-The load is a single transaction. Either the whole run lands or none of it does,
+The warehouse side lives in `store`, and the rules for where a venue starts
+and how far its watermark may move in `watermark`; this module runs them in
+order. The load is a single transaction. Either the whole run lands or none of it does,
 so a crash halfway through eight venues cannot leave three venues a day ahead of
 the other five. `run_at` opens the warehouse only for the plan and the load, so
 the minutes spent on the network do not lock out `resolve` or a BI reader.
@@ -28,18 +30,27 @@ import functools
 import logging
 import math
 import uuid
-from collections.abc import Callable, Iterator
+from collections.abc import Callable
 from dataclasses import dataclass, field
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
-import duckdb
-
-from . import client, quality
+from . import client, quality, store
+from . import watermark as watermark_rules
+from .store import (  # re-exported: the package's public surface lives here
+    ACCEPTED,
+    ALL_DAYS,
+    SUPERSEDED,
+    Days,
+    accepted_days,
+    connect,
+    get_watermark,
+    resolve,
+    utc_now,
+)
+from .watermark import plan_windows
 
 log = logging.getLogger(__name__)
-
-UTC = timezone.utc  # datetime.UTC only exists from 3.11; this keeps 3.10 working
 
 DEFAULT_CHUNK_DAYS = 30
 DEFAULT_BACKFILL_DAYS = 90
@@ -76,83 +87,6 @@ TRUST_LAG_DAYS = 7
 # Two venues in a row failing to connect, before any venue has succeeded, is
 # the network rather than the venues. The rest are not attempted.
 TRANSPORT_BREAKER = 2
-
-ACCEPTED = "accepted"  # an operator decided the day is never arriving
-SUPERSEDED = "superseded"  # the day later loaded cleanly
-
-SCHEMA = """
-CREATE TABLE IF NOT EXISTS pageviews (
-    venue_id    VARCHAR NOT NULL,
-    article     VARCHAR NOT NULL,
-    view_date   DATE    NOT NULL,
-    views       BIGINT  NOT NULL,
-    run_id      VARCHAR NOT NULL,
-    loaded_at   TIMESTAMP NOT NULL,  -- UTC
-    PRIMARY KEY (venue_id, view_date)
-);
-
-CREATE TABLE IF NOT EXISTS quarantine (
-    run_id       VARCHAR NOT NULL,
-    venue_id     VARCHAR NOT NULL,
-    article      VARCHAR NOT NULL,
-    -- NULL only for a `timestamp_parses` rejection, which has no day. The
-    -- window it arrived in is the nearest thing it has to one.
-    view_date    DATE,
-    rule         VARCHAR NOT NULL,
-    detail       VARCHAR,
-    raw          VARCHAR,
-    seen_at      TIMESTAMP NOT NULL,  -- UTC
-    resolved_at  TIMESTAMP,           -- UTC; set with `resolution`
-    resolution   VARCHAR,             -- NULL (open), 'accepted' or 'superseded'
-    window_start DATE,
-    window_end   DATE,
-    note         VARCHAR              -- the operator's annotation, kept across reopening
-);
-
-CREATE TABLE IF NOT EXISTS watermark (
-    venue_id   VARCHAR PRIMARY KEY,
-    last_date  DATE NOT NULL,
-    updated_at TIMESTAMP NOT NULL,  -- UTC
-    article    VARCHAR              -- the title the coverage up to last_date is for
-);
-
-CREATE TABLE IF NOT EXISTS run_log (
-    run_id            VARCHAR PRIMARY KEY,
-    started_at        TIMESTAMP NOT NULL,  -- UTC
-    finished_at       TIMESTAMP,  -- UTC
-    status            VARCHAR NOT NULL,
-    venues            INTEGER NOT NULL,
-    requests          INTEGER NOT NULL,  -- windows asked for
-    rows_fetched      INTEGER NOT NULL,
-    rows_loaded       INTEGER NOT NULL,
-    rows_quarantined  INTEGER NOT NULL,
-    reject_rate       DOUBLE,
-    note              VARCHAR,
-    http_requests     INTEGER            -- NULL when the fetcher was injected
-);
-"""
-
-# `CREATE TABLE IF NOT EXISTS` does nothing to a table that already exists, so a
-# warehouse built by an earlier version keeps the old shape. Adding a column is
-# idempotent, and every insert here names its columns, so a migrated column
-# landing at the end rather than where the DDL above puts it does not matter.
-#
-# The UPDATE moves free-text annotations out of `resolution`, where earlier
-# versions kept them, into `note`: `resolution` now holds only decisions the
-# code acts on. Those annotations never released anything, so the rows reopen.
-MIGRATIONS = f"""
-ALTER TABLE quarantine ADD COLUMN IF NOT EXISTS view_date DATE;
-ALTER TABLE quarantine ADD COLUMN IF NOT EXISTS resolved_at TIMESTAMP;
-ALTER TABLE quarantine ADD COLUMN IF NOT EXISTS resolution VARCHAR;
-ALTER TABLE quarantine ADD COLUMN IF NOT EXISTS window_start DATE;
-ALTER TABLE quarantine ADD COLUMN IF NOT EXISTS window_end DATE;
-ALTER TABLE quarantine ADD COLUMN IF NOT EXISTS note VARCHAR;
-ALTER TABLE watermark ADD COLUMN IF NOT EXISTS article VARCHAR;
-ALTER TABLE run_log ADD COLUMN IF NOT EXISTS http_requests INTEGER;
-UPDATE quarantine
-SET note = coalesce(note, resolution), resolution = NULL, resolved_at = NULL
-WHERE resolution IS NOT NULL AND resolution NOT IN ('{ACCEPTED}', '{SUPERSEDED}');
-"""
 
 
 @dataclass(frozen=True)
@@ -196,23 +130,6 @@ class RunSummary:
     reject_rate: float = 0.0
     note: str = ""
     http_requests: int | None = None
-
-
-def utc_now() -> datetime:
-    """Now, in UTC, with no offset attached - which is what the columns hold.
-
-    DuckDB's TIMESTAMP is timezone-naive, and given an aware datetime it stores
-    the session's LOCAL wall time. Dropping the offset after converting to UTC
-    stores UTC. TIMESTAMPTZ would need pytz to read back.
-    """
-    return datetime.now(UTC).replace(tzinfo=None)
-
-
-def connect(db_path: str | Path) -> duckdb.DuckDBPyConnection:
-    con = duckdb.connect(str(db_path))
-    con.execute(SCHEMA)
-    con.execute(MIGRATIONS)
-    return con
 
 
 VENUE_COLUMNS = ("venue_id", "venue_name", "region", "wiki_article")
@@ -273,99 +190,18 @@ def read_venues(path: str | Path) -> list[Venue]:
     return venues
 
 
-def plan_windows(start: date, end: date, chunk_days: int) -> list[tuple[date, date]]:
-    """Split an inclusive range into windows of at most chunk_days."""
-    if chunk_days < 1:
-        raise ValueError("chunk_days must be at least 1")
-    windows = []
-    cursor = start
-    while cursor <= end:
-        stop = min(cursor + timedelta(days=chunk_days - 1), end)
-        windows.append((cursor, stop))
-        cursor = stop + timedelta(days=1)
-    return windows
-
-
-def get_watermark(con, venue_id: str) -> date | None:
-    row = _watermark_row(con, venue_id)
-    return row[0] if row else None
-
-
-def _watermark_row(con, venue_id: str) -> tuple[date, str | None] | None:
-    return con.execute(
-        "SELECT last_date, article FROM watermark WHERE venue_id = ?", [venue_id]
-    ).fetchone()
-
-
 def start_date_for(con, venue: Venue, end: date, backfill_days: int) -> date:
-    """Resume the day after the watermark, or backfill on first sight of a venue.
-
-    Two watermarks are not a record of coverage for this venue, and the whole
-    backfill window is asked for again:
-
-    - One for a venue that has never produced a row. The frontier is a property
-      of the API, so healthy siblings walk a dead venue's watermark along the
-      trust line; a typo corrected in venues.csv would otherwise recover only
-      the days since.
-    - One recorded for a different title. Coverage of a redirect says nothing
-      about the canonical article that replaced it.
-    """
-    row = _watermark_row(con, venue.venue_id)
-    backfill = end - timedelta(days=backfill_days - 1)
-    if row is None:
-        return backfill
-    watermark, article = row
-    retitled = article is not None and article != venue.wiki_article
-    if retitled or not _has_any_rows(con, venue.venue_id):
-        return min(watermark + timedelta(days=1), backfill)
-    return watermark + timedelta(days=1)
-
-
-def _venue_watermark(
-    start: date,
-    end: date,
-    venue_clean: list[quality.CleanRow],
-    venue_bad: list[quality.BadRow],
-    trusted_end: date | None,
-    accepted: set[date] | None = None,
-    accepted_null: set[tuple[str, date | None]] | None = None,
-) -> date | None:
-    """How far this venue may advance. None means leave the watermark alone.
-
-    The watermark promises that every day up to it has been dealt with, so it may
-    not step over a day we failed to load.
-
-    - A rejected day inside the requested range is a hard stop, whatever its
-      age, unless an operator has accepted it. A rejected day outside the range
-      is recorded but does not stop anything: the watermark passed it runs ago.
-    - A rejected row with no parseable day stops the watermark before the
-      window it arrived in, since any day of that window could be the one it
-      was for - unless an operator has accepted that rule for that window.
-    - An absent day before one that arrived is settled: publication runs in date
-      order. (`client.fetch_window` has already re-asked such holes narrowly.)
-    - An absent day after the last one that arrived is settled only once it is
-      older than `trusted_end`. With no evidence anywhere that the upstream
-      has published (`trusted_end` is None), nothing is settled: in that case
-      no venue loaded anything either, so the watermark stays where it is.
-    """
-    accepted = accepted or set()
-    accepted_null = accepted_null or set()
-    stops = []
-    for row in venue_bad:
-        if row.view_date is None:
-            if (row.rule, row.window_start) not in accepted_null:
-                stops.append(row.window_start or start)
-        elif start <= row.view_date <= end and row.view_date not in accepted:
-            stops.append(row.view_date)
-    ceiling = min(stops) - timedelta(days=1) if stops else end
-
-    if trusted_end is None:
-        return None
-    loaded = [row.view_date for row in venue_clean]
-    trusted = min(end, trusted_end)
-    frontier = max(max(loaded), trusted) if loaded else trusted
-    frontier = min(frontier, ceiling)
-    return frontier if frontier >= start else None
+    """Resume the day after the watermark, or backfill; see `watermark.start_date`."""
+    row = store.watermark_row(con, venue.venue_id)
+    watermark, article = row or (None, None)
+    return watermark_rules.start_date(
+        watermark,
+        article,
+        store.has_any_rows(con, venue.venue_id),
+        venue.wiki_article,
+        end,
+        backfill_days,
+    )
 
 
 def validate_params(
@@ -522,16 +358,16 @@ def _advance_watermarks(
     notes: list[str] = []
     for f in fetched:
         venue = f.venue
-        frontier = _venue_watermark(
+        frontier = watermark_rules.venue_frontier(
             f.start,
             end,
             f.clean,
             f.bad,
             trusted_end,
-            accepted=accepted_days(con, venue.venue_id),
-            accepted_null=accepted_null_windows(con, venue.venue_id),
+            accepted=store.accepted_days(con, venue.venue_id),
+            accepted_null=store.accepted_null_windows(con, venue.venue_id),
         )
-        current, stored_article = _watermark_row(con, venue.venue_id) or (None, None)
+        current, stored_article = store.watermark_row(con, venue.venue_id) or (None, None)
         retitled = stored_article is not None and stored_article != venue.wiki_article
         if retitled:
             notes.append(
@@ -546,7 +382,7 @@ def _advance_watermarks(
         elif current is not None and stored_article is None:
             new_watermarks[venue.venue_id] = current  # record which title it is for
 
-        has_history = _has_any_rows(con, venue.venue_id) and not retitled
+        has_history = store.has_any_rows(con, venue.venue_id) and not retitled
         if not has_history and not f.clean:
             # A typo in venues.csv, an article that 404s everywhere, or a title
             # that resolves to a different article so every row is rejected.
@@ -574,29 +410,6 @@ def _advance_watermarks(
     return new_watermarks, never_produced, notes
 
 
-def _reject_key(venue_id, view_date, rule, window_start) -> tuple:
-    """The identity of a rejection: one per venue, day and rule.
-
-    A row with no day is identified by the window it arrived in instead, so an
-    accepted one is recognised when the same window is asked for again, and a
-    new one in a later window is not mistaken for it.
-    """
-    return (venue_id, view_date, rule, window_start if view_date is None else None)
-
-
-_KEY_COLUMNS = "venue_id, view_date, rule, CASE WHEN view_date IS NULL THEN window_start END"
-_KEY_MATCH = (
-    "venue_id = ? AND view_date IS NOT DISTINCT FROM ? AND rule = ? "
-    "AND (view_date IS NOT NULL OR window_start IS NOT DISTINCT FROM ?)"
-)
-
-
-def _is_accepted(row: quality.BadRow, days: set[date], null_windows: set) -> bool:
-    if row.view_date is None:
-        return (row.rule, row.window_start) in null_windows
-    return row.view_date in days
-
-
 def _apply_gate(
     con,
     fetched: list[Fetched],
@@ -616,11 +429,11 @@ def _apply_gate(
     the bad days until they load cleanly or are accepted.
     """
     notes: list[str] = []
-    already = set(con.execute(f"SELECT {_KEY_COLUMNS} FROM quarantine").fetchall())
+    already = store.known_reject_keys(con)
     novel = [
         r
         for r in bad
-        if _reject_key(r.venue_id, r.view_date, r.rule, r.window_start) not in already
+        if store.reject_key(r.venue_id, r.view_date, r.rule, r.window_start) not in already
     ]
     if len(novel) != len(bad):
         notes.append(
@@ -630,58 +443,18 @@ def _apply_gate(
     held = set()
     for f in fetched:
         venue_id = f.venue.venue_id
-        days, null_windows = accepted_days(con, venue_id), accepted_null_windows(con, venue_id)
+        days = store.accepted_days(con, venue_id)
+        null_windows = store.accepted_null_windows(con, venue_id)
         seen = len(f.clean) + len(f.bad)
         fresh = sum(
-            1 for r in novel if r.venue_id == venue_id and not _is_accepted(r, days, null_windows)
+            1
+            for r in novel
+            if r.venue_id == venue_id and not watermark_rules.is_accepted(r, days, null_windows)
         )
         if seen and quality.reject_rate(seen, fresh) > max_reject_rate:
             held.add(venue_id)
             notes.append(f"{venue_id}: {fresh}/{seen} newly rejected, above the ceiling, held")
     return held, notes
-
-
-def _publication_frontier(con, clean: list[quality.CleanRow], end: date) -> date | None:
-    """The newest day any venue has ever produced a row for, or None if none has.
-
-    Read from the warehouse as well as from this run, because during a stall this
-    run sees nothing at all. Bounded by `end`, so a future-dated row that predates
-    the acceptance rules cannot pin the frontier open for ever.
-    """
-    stored = con.execute(
-        "SELECT max(view_date) FROM pageviews WHERE view_date <= ?", [end]
-    ).fetchone()[0]
-    seen = [row.view_date for row in clean if row.view_date <= end]
-    if stored is not None:
-        seen.append(stored)
-    return max(seen) if seen else None
-
-
-def _has_any_rows(con, venue_id: str) -> bool:
-    row = con.execute("SELECT 1 FROM pageviews WHERE venue_id = ? LIMIT 1", [venue_id]).fetchone()
-    return row is not None
-
-
-def _blocked_venues(con, venue_ids: list[str]) -> set[str]:
-    """Configured venues with an open rejection their watermark has not passed.
-
-    Only those still stand between the venue and a complete warehouse. A
-    rejection behind the watermark (a stray day outside the requested window,
-    say) is on record but blocks nothing, and one for a venue no longer in
-    venues.csv is nobody's problem tonight.
-    """
-    if not venue_ids:
-        return set()
-    rows = con.execute(
-        "SELECT DISTINCT q.venue_id FROM quarantine q "
-        "LEFT JOIN watermark w ON w.venue_id = q.venue_id "
-        "WHERE q.resolution IS NULL AND list_contains(?, q.venue_id) "
-        "AND (w.last_date IS NULL "
-        "     OR coalesce(q.view_date, q.window_start) IS NULL "
-        "     OR coalesce(q.view_date, q.window_start) > w.last_date)",
-        [venue_ids],
-    ).fetchall()
-    return {row[0] for row in rows}
 
 
 @dataclass
@@ -738,16 +511,7 @@ def run_at(db_path: str | Path, venues: list[Venue], **options) -> RunSummary:
     locks out every other process, readers included. Holding it through the
     fetch locked out `resolve` and any BI tool for as long as the network took.
     """
-    return _run(lambda: _opened(db_path), venues, **options)
-
-
-@contextlib.contextmanager
-def _opened(db_path: str | Path) -> Iterator[duckdb.DuckDBPyConnection]:
-    con = connect(db_path)
-    try:
-        yield con
-    finally:
-        con.close()
+    return _run(lambda: store.opened(db_path), venues, **options)
 
 
 def _run(
@@ -772,7 +536,7 @@ def _run(
         trust_lag_days,
         max_http_requests,
     )
-    today = today or datetime.now(UTC).date()
+    today = today or utc_now().date()
     end = today - timedelta(days=PUBLICATION_LAG_DAYS)
     floor = end - timedelta(days=max_lookback_days - 1)
     calendar_trust_line = today - timedelta(days=trust_lag_days)
@@ -827,7 +591,7 @@ def _run(
         # warehouse may be why the run failed), and must not hide the reason.
         try:
             with session() as con:
-                _write_run_log(con, summary, started_at)
+                store.write_run_log(con, summary, started_at)
         except Exception as log_exc:
             log.error("could not record the failed run %s: %s", run_id, log_exc)
         raise
@@ -858,7 +622,7 @@ def _finish(
     # was a bet that the lag never outruns it; bounded by what has been seen, a
     # stall costs a re-request instead of the days. With no evidence anywhere,
     # nothing is trusted and no watermark moves.
-    observed = _publication_frontier(con, clean, end)
+    observed = store.publication_frontier(con, clean, end)
     trusted_end = None if observed is None else min(calendar_trust_line, observed)
 
     new_watermarks, never_produced, watermark_notes = _advance_watermarks(
@@ -881,7 +645,7 @@ def _finish(
         # tonight, not from tomorrow.
         status, unresolved = decide_status(
             held=held,
-            blocked=_blocked_venues(con, [v.venue_id for v in venues]),
+            blocked=store.blocked_venues(con, [v.venue_id for v in venues]),
             failed=set(outcome.failures),
             gave_up={p.venue.venue_id for p in plans if p.gave_up_days},
             never_produced=never_produced,
@@ -893,7 +657,7 @@ def _finish(
         summary.note = "; ".join(lines)
 
     articles = {f.venue.venue_id: f.venue.wiki_article for f in outcome.fetched}
-    _load(
+    store.load(
         con,
         summary.run_id,
         clean,
@@ -912,199 +676,23 @@ def _finish(
     )
 
 
-def _store_rejects(con, run_id: str, bad: list[quality.BadRow]) -> None:
-    """Keep one rejection per key (see `_reject_key`); the caller owns the transaction.
-
-    Seeing a rejection again reopens it if it had been superseded - the day
-    loaded cleanly once and has gone bad again. An accepted one stays accepted:
-    the API keeps answering the same way, and reopening it would undo the
-    decision on the very next run. The operator's note survives either way.
-    """
-    already = set(con.execute(f"SELECT {_KEY_COLUMNS} FROM quarantine").fetchall())
-    now = utc_now()
-    for row in bad:
-        key = _reject_key(row.venue_id, row.view_date, row.rule, row.window_start)
-        if key in already:
-            con.execute(
-                f"UPDATE quarantine SET resolved_at = NULL, resolution = NULL "
-                f"WHERE {_KEY_MATCH} AND resolution = ?",
-                [*key, SUPERSEDED],
-            )
-            continue
-        con.execute(
-            "INSERT INTO quarantine (run_id, venue_id, article, view_date, rule, detail, raw, "
-            "seen_at, window_start, window_end) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            [
-                run_id,
-                row.venue_id,
-                row.article,
-                row.view_date,
-                row.rule,
-                row.detail,
-                row.raw,
-                now,
-                row.window_start,
-                row.window_end,
-            ],
-        )
-        already.add(key)
-
-
-def _supersede(con, run_id: str, now: datetime) -> None:
-    """Close the open rejections for every day this run loaded cleanly.
-
-    Without this a one-night upstream glitch kept the run `degraded` for ever,
-    after the day had loaded and the watermark had passed it, and the only way
-    out was `--accept` - which says the day is never coming, the opposite of
-    what happened.
-    """
-    con.execute(
-        "UPDATE quarantine SET resolved_at = ?, resolution = ? "
-        "WHERE resolution IS NULL AND view_date IS NOT NULL AND EXISTS ("
-        "  SELECT 1 FROM pageviews p WHERE p.run_id = ? "
-        "  AND p.venue_id = quarantine.venue_id AND p.view_date = quarantine.view_date)",
-        [now, SUPERSEDED, run_id],
-    )
-
-
-# What `resolve` can be pointed at: one day, a range of days, the rejects with
-# no day, or all of a venue's rejects.
-ALL_DAYS = "all"
-Days = date | tuple[date, date] | None | str
-
-
-def _day_filter(days: Days) -> tuple[str, list]:
-    if days is None:
-        return "view_date IS NULL", []
-    if days == ALL_DAYS:
-        return "TRUE", []
-    if isinstance(days, tuple):
-        first, last = days
-        if first > last:
-            raise ValueError(f"range {first}..{last} runs backwards")
-        return "view_date BETWEEN ? AND ?", [first, last]
-    if isinstance(days, date):
-        return "view_date = ?", [days]
-    raise ValueError(f"not a day, a range, None or {ALL_DAYS!r}: {days!r}")
-
-
-def resolve(
-    con, venue_id: str, days: Days, *, note: str | None = None, accept: bool = False
-) -> int:
-    """Record a decision about quarantined rows. Returns how many rows it changed.
-
-    - A note is annotation. It releases nothing: the day stays a hard stop,
-      because the data is still missing. It survives the row reopening.
-    - `accept=True` is the operator saying the day is never coming. The
-      watermark may then step over it, which is the only way out for a venue
-      whose upstream keeps answering the same wrong thing. Only open rows are
-      accepted; the note, if given, is kept with the decision.
-
-    `days` is a date, a (first, last) range, None for the rows a
-    `timestamp_parses` failure left with no day, or ALL_DAYS.
-    """
-    where, params = _day_filter(days)
-    note = note.strip() if note else None
-    if accept:
-        rows = con.execute(
-            f"UPDATE quarantine SET resolved_at = ?, resolution = ?, note = coalesce(?, note) "
-            f"WHERE venue_id = ? AND {where} AND resolution IS NULL RETURNING rule",
-            [utc_now(), ACCEPTED, note, venue_id, *params],
-        ).fetchall()
-    else:
-        if not note:
-            raise ValueError("A note is required to annotate a rejection")
-        rows = con.execute(
-            f"UPDATE quarantine SET note = ? WHERE venue_id = ? AND {where} RETURNING rule",
-            [note, venue_id, *params],
-        ).fetchall()
-    return len(rows)
-
-
-def accepted_days(con, venue_id: str) -> set[date]:
-    """Days an operator has accepted as never arriving, for this venue."""
-    return {
-        row[0]
-        for row in con.execute(
-            "SELECT DISTINCT view_date FROM quarantine "
-            "WHERE venue_id = ? AND resolution = ? AND view_date IS NOT NULL",
-            [venue_id, ACCEPTED],
-        ).fetchall()
-    }
-
-
-def accepted_null_windows(con, venue_id: str) -> set[tuple[str, date | None]]:
-    """(rule, window_start) of the dateless rejects an operator has accepted."""
-    return set(
-        con.execute(
-            "SELECT DISTINCT rule, window_start FROM quarantine "
-            "WHERE venue_id = ? AND resolution = ? AND view_date IS NULL",
-            [venue_id, ACCEPTED],
-        ).fetchall()
-    )
-
-
-def _load(con, run_id, clean, bad, new_watermarks, summary, started_at, settle=None) -> None:
-    """Write the run: rows, quarantine, watermarks, status and run log, atomically.
-
-    `new_watermarks` maps venue_id to (last_date, article). `settle(con)`, if
-    given, runs after everything but the run log is written, and sets the
-    summary's status and note from what is now in the warehouse.
-
-    The run log is inside the transaction with the data it describes, so
-    `sum(rows_loaded)` cannot disagree with `count(*)`.
-    """
-    now = utc_now()
-    try:
-        con.execute("BEGIN TRANSACTION")
-        if clean:
-            con.executemany(
-                "INSERT OR REPLACE INTO pageviews "
-                "(venue_id, article, view_date, views, run_id, loaded_at) "
-                "VALUES (?, ?, ?, ?, ?, ?)",
-                [(r.venue_id, r.article, r.view_date, r.views, run_id, now) for r in clean],
-            )
-        _store_rejects(con, run_id, bad)
-        _supersede(con, run_id, now)
-        if new_watermarks:
-            con.executemany(
-                "INSERT OR REPLACE INTO watermark (venue_id, last_date, updated_at, article) "
-                "VALUES (?, ?, ?, ?)",
-                [(vid, last, now, article) for vid, (last, article) in new_watermarks.items()],
-            )
-        if settle is not None:
-            settle(con)
-        _write_run_log(con, summary, started_at)
-        con.execute("COMMIT")
-    except BaseException:
-        # BaseException: Ctrl-C and SystemExit are when a half-written
-        # transaction is likeliest. The ROLLBACK is guarded so its own failure
-        # cannot replace the error that explains what went wrong.
-        try:
-            con.execute("ROLLBACK")
-        except BaseException:
-            pass
-        raise
-
-
-def _write_run_log(con, summary: RunSummary, started_at: datetime) -> None:
-    con.execute(
-        "INSERT OR REPLACE INTO run_log "
-        "(run_id, started_at, finished_at, status, venues, requests, "
-        " rows_fetched, rows_loaded, rows_quarantined, reject_rate, note, http_requests) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        [
-            summary.run_id,
-            started_at,
-            utc_now(),
-            summary.status,
-            summary.venues,
-            summary.requests,
-            summary.rows_fetched,
-            summary.rows_loaded,
-            summary.rows_quarantined,
-            summary.reject_rate,
-            summary.note,
-            summary.http_requests,
-        ],
-    )
+__all__ = [
+    "ACCEPTED",
+    "ALL_DAYS",
+    "SUPERSEDED",
+    "Days",
+    "RunSummary",
+    "Venue",
+    "accepted_days",
+    "connect",
+    "decide_status",
+    "get_watermark",
+    "plan_windows",
+    "read_venues",
+    "resolve",
+    "run",
+    "run_at",
+    "start_date_for",
+    "utc_now",
+    "validate_params",
+]

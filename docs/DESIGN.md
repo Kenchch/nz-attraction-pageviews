@@ -417,6 +417,12 @@ The suite runs without network access. The HTTP call is injected into `fetch_win
 fetcher is injected into `ingest.run`, so the suite drives real code paths with
 stubbed transport rather than mocking out the logic being tested.
 
+The code is laid out so the rules can be tested without the plumbing:
+`watermark.py` holds where a venue starts and how far it may advance as pure
+functions of dates and rows (`tests/test_watermark.py` checks them one case at
+a time), `store.py` holds the schema and every SQL statement, and `ingest.py`
+runs the steps in order.
+
 Covered: URL quoting for titles like `Sky_Tower_(Auckland)`, 404 verified before
 it is believed and accepted as empty only when every widening and every slice
 agrees, a first widening that answers 200 with pad-region rows only still falling
@@ -533,8 +539,9 @@ workflow runs the live smoke test weekly.
   holds rows, would still be recorded as "no traffic" for days older than the
   trust line. Catching that needs a backfill sweep, which is not built here.
 - No orchestrator. In production this would be an Airflow or cron task; the
-  entry point is deliberately a single idempotent command so that wiring it up
-  is one line.
+  entry point is deliberately a single idempotent command with distinct exit
+  codes, so wiring it up is one line. The README's "Running it nightly" gives
+  cron and Task Scheduler examples and the query to alert on.
 
 ## Data
 

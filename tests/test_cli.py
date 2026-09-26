@@ -15,7 +15,7 @@ import duckdb
 import pytest
 
 from nz_attraction_pageviews import __main__ as cli
-from nz_attraction_pageviews import client, ingest, quality
+from nz_attraction_pageviews import client, quality, store
 
 TODAY = "2026-03-01"
 CSV = (
@@ -180,7 +180,7 @@ def test_the_warehouse_is_not_held_open_while_fetching(files, monkeypatch):
     BI tools for as long as the network took. It is now opened only to plan and
     to load."""
     opened = []
-    real_connect = ingest.connect
+    real_connect = store.connect
 
     def tracking_connect(path):
         con = real_connect(path)
@@ -201,7 +201,7 @@ def test_the_warehouse_is_not_held_open_while_fetching(files, monkeypatch):
         fetching_with_open.append(any(is_open(c) for c in opened))
         return api(request, timeout)
 
-    monkeypatch.setattr(ingest, "connect", tracking_connect)
+    monkeypatch.setattr(store, "connect", tracking_connect)
     monkeypatch.setattr(urllib.request, "urlopen", urlopen)
 
     assert cli.main(ingest_args(files, "--backfill-days", "5")) == cli.EXIT_OK
