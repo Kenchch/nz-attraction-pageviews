@@ -10,7 +10,7 @@ from datetime import date, timedelta
 
 import pytest
 
-from nz_attraction_pageviews import ingest, quality
+from nz_attraction_pageviews import ingest
 
 
 @pytest.fixture
@@ -62,18 +62,14 @@ def _nightly(con, nights=25):
         healthy_before = con.execute(
             "SELECT count(*) FROM pageviews WHERE venue_id NOT IN ('v0','v1','v2','v3','v4')"
         ).fetchone()[0]
-        try:
-            summary = ingest.run(
-                con,
-                EIGHT,
-                today=TODAY + timedelta(days=night),
-                backfill_days=10,
-                chunk_days=30,
-                fetch=_feed(state),
-            )
-            status = summary.status
-        except quality.QualityGateFailed:
-            status = "raised"
+        status = ingest.run(
+            con,
+            EIGHT,
+            today=TODAY + timedelta(days=night),
+            backfill_days=10,
+            chunk_days=30,
+            fetch=_feed(state),
+        ).status
         healthy_after = con.execute(
             "SELECT count(*) FROM pageviews WHERE venue_id NOT IN ('v0','v1','v2','v3','v4')"
         ).fetchone()[0]
@@ -109,10 +105,9 @@ def test_a_standing_failure_is_reported_every_night_not_just_the_first(con):
     log = _nightly(con)
 
     reported = [status for _, status, _ in log]
-    assert set(reported) <= {"degraded", "raised"}, (
-        f"a night reported a status that hides five held venues: {reported[:8]}"
+    assert set(reported) == {"degraded"}, (
+        f"a night reported a status that hides five broken venues: {reported[:8]}"
     )
-    assert "ok" not in reported, f"a run went green with five venues held: {reported[:8]}"
 
 
 def test_the_held_venues_are_named_in_the_run_log(con):
@@ -121,18 +116,14 @@ def test_the_held_venues_are_named_in_the_run_log(con):
     ingest.run(con, EIGHT, today=TODAY, backfill_days=10, chunk_days=30, fetch=_feed(state))
     state["drifted"] = True
 
-    try:
-        summary = ingest.run(
-            con,
-            EIGHT,
-            today=TODAY + timedelta(days=1),
-            backfill_days=10,
-            chunk_days=30,
-            fetch=_feed(state),
-        )
-        note = summary.note
-    except quality.QualityGateFailed as exc:
-        note = str(exc)
+    note = ingest.run(
+        con,
+        EIGHT,
+        today=TODAY + timedelta(days=1),
+        backfill_days=10,
+        chunk_days=30,
+        fetch=_feed(state),
+    ).note
 
     named = [v for v in sorted(DRIFTED) if v in note]
     assert len(named) == len(DRIFTED), f"only {named} named in: {note!r}"

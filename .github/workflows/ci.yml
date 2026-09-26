@@ -26,22 +26,27 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
         with:
           python-version: ${{ matrix.python-version }}
-          cache: pip
+          enable-cache: true
 
+      # From uv.lock, exactly: an unpinned `pip install ruff` let a new ruff
+      # release turn unrelated pull requests red. --locked fails if the lock
+      # no longer matches pyproject.toml. Installing the project itself is
+      # what tests the packaging.
       - name: Install
-        run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt ruff
+        run: uv sync --locked
 
       - name: Lint
-        run: ruff check .
+        run: uv run ruff check .
 
       - name: Format
-        run: ruff format --check .
+        run: uv run ruff format --check .
 
       - name: Test
         # The suite stubs the network, so CI never calls the Wikimedia API.
-        run: pytest -q
+        run: uv run pytest -q --cov --cov-fail-under=90
+
+      - name: Build
+        run: uv build

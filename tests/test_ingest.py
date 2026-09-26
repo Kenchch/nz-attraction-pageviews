@@ -5,14 +5,9 @@ from __future__ import annotations
 from datetime import date, timedelta
 
 import pytest
+from helpers import TODAY, VENUES, Recorder
 
 from nz_attraction_pageviews import client, ingest
-
-TODAY = date(2026, 3, 1)
-VENUES = [
-    ingest.Venue("milford-sound", "Milford Sound", "Fiordland", "Milford_Sound"),
-    ingest.Venue("te-papa", "Te Papa", "Wellington", "Museum_of_New_Zealand_Te_Papa_Tongarewa"),
-]
 
 
 @pytest.fixture
@@ -20,36 +15,6 @@ def con(tmp_path):
     connection = ingest.connect(tmp_path / "test.duckdb")
     yield connection
     connection.close()
-
-
-class Recorder:
-    """Stub fetcher. Returns one row per day and remembers what it was asked for."""
-
-    def __init__(self, views=50):
-        self.views = views
-        self.calls = []
-
-    def __call__(self, article, start, end):
-        self.calls.append((article, start, end))
-        rows, cursor = [], start
-        while cursor <= end:
-            rows.append(
-                {
-                    "project": "en.wikipedia",
-                    "article": article,
-                    "granularity": "daily",
-                    "timestamp": f"{cursor:%Y%m%d}00",
-                    "access": "all-access",
-                    "agent": "user",
-                    "views": self.views,
-                }
-            )
-            cursor += timedelta(days=1)
-        return rows
-
-    @property
-    def days_requested(self):
-        return sum((end - start).days + 1 for _, start, end in self.calls)
 
 
 def test_plan_windows_splits_and_covers_every_day():
@@ -227,9 +192,9 @@ class Poisoner:
 
 
 def test_watermark_does_not_step_over_quarantined_days(con):
-    """The run-level gate is a rate across every venue, so one venue's bad patch
-    can sit under the threshold and pass. The watermark must not advance past it
-    anyway, or the quarantine becomes a record of data we permanently lost.
+    """A bad day under the hold ceiling still lets the venue's other days load.
+    The watermark must not advance past it anyway, or the quarantine becomes a
+    record of data we permanently lost.
     """
     end = TODAY - timedelta(days=ingest.PUBLICATION_LAG_DAYS)
     first_day = end - timedelta(days=9)
@@ -389,7 +354,11 @@ def test_days_absent_from_a_200_are_picked_up_once_they_publish(con):
 def test_a_hole_behind_a_day_that_arrived_is_trusted_as_quiet(con):
     """The API omits days with no traffic rather than sending a zero, so a hole is
     ambiguous. A later day arriving settles it: publication runs in date order, so
-    the earlier day was published and its absence can only mean nobody looked."""
+    the earlier day was published and its absence can only mean nobody looked.
+
+    That is only safe because client.fetch_window has already re-asked the hole
+    in narrow slices (see test_client.py); this stub stands in for what is left
+    after that verification, a hole that stayed empty."""
     end = TODAY - timedelta(days=ingest.PUBLICATION_LAG_DAYS)
     hole = end - timedelta(days=5)
 
@@ -583,7 +552,8 @@ def test_nothing_published_anywhere_holds_every_watermark(con):
 
     summary = ingest.run(con, VENUES, today=TODAY, backfill_days=10, chunk_days=30, fetch=nothing)
 
-    assert summary.status == "ok"
+    # Holding is right, and it is not `ok`: no venue has any data at all.
+    assert summary.status == "degraded"
     for venue in VENUES:
         assert ingest.get_watermark(con, venue.venue_id) is None
 
@@ -694,7 +664,8 @@ def test_lookback_is_capped_and_the_giving_up_is_recorded(con):
     every night, for ever."""
     end = TODAY - timedelta(days=ingest.PUBLICATION_LAG_DAYS)
     con.execute(
-        "INSERT OR REPLACE INTO watermark VALUES (?, ?, current_timestamp)",
+        "INSERT OR REPLACE INTO watermark (venue_id, last_date, updated_at) "
+        "VALUES (?, ?, current_timestamp)",
         ["milford-sound", end - timedelta(days=400)],
     )
 
@@ -761,7 +732,8 @@ def test_a_failed_run_keeps_the_note_about_days_it_abandoned(con):
     """
     end = TODAY - timedelta(days=ingest.PUBLICATION_LAG_DAYS)
     con.execute(
-        "INSERT OR REPLACE INTO watermark VALUES (?, ?, current_timestamp)",
+        "INSERT OR REPLACE INTO watermark (venue_id, last_date, updated_at) "
+        "VALUES (?, ?, current_timestamp)",
         ["milford-sound", end - timedelta(days=400)],
     )
 
@@ -797,7 +769,8 @@ def test_a_failure_partway_through_still_reports_what_was_abandoned(con):
     even when nothing reached the gate."""
     end = TODAY - timedelta(days=ingest.PUBLICATION_LAG_DAYS)
     con.execute(
-        "INSERT OR REPLACE INTO watermark VALUES (?, ?, current_timestamp)",
+        "INSERT OR REPLACE INTO watermark (venue_id, last_date, updated_at) "
+        "VALUES (?, ?, current_timestamp)",
         ["milford-sound", end - timedelta(days=400)],
     )
 
@@ -883,9 +856,9 @@ def test_read_venues_parses_the_shipped_csv():
 
 def test_a_venue_that_has_never_returned_a_row_is_named_in_the_note(con):
     """The shape a typo in venues.csv makes: the article does not exist, every
-    width and slice 404s, the window verifies as genuinely empty and the run
-    reports `ok` having quietly retired the whole backfill. Nothing else in the
-    summary tells that apart from a venue nobody reads."""
+    width and slice 404s, and the window verifies as genuinely empty. Nothing
+    else in the summary tells that apart from a venue nobody reads, so it is
+    named, and the run is not `ok` until it produces something."""
 
     def nothing_for_milford(article, start, end):
         if article == "Milford_Sound":
@@ -896,7 +869,8 @@ def test_a_venue_that_has_never_returned_a_row_is_named_in_the_note(con):
         con, VENUES, today=TODAY, backfill_days=10, chunk_days=30, fetch=nothing_for_milford
     )
 
-    assert summary.status == "ok"
+    assert summary.status == "degraded"
+    assert "unresolved: milford-sound" in summary.note
     assert "milford-sound" in summary.note
     assert "Milford_Sound" in summary.note, "name the article, since that is what is wrong"
     assert "te-papa" not in summary.note
@@ -934,7 +908,8 @@ def test_an_oversized_views_value_is_quarantined_without_taking_the_run_down(con
         fetch=one_absurd_day,
     )
 
-    assert summary.status == "ok"
+    # Not held (max_reject_rate=1.0), but the rejected day is still missing.
+    assert summary.status == "degraded"
     assert summary.rows_quarantined == 1
     assert con.execute("SELECT rule FROM quarantine").fetchone()[0] == "views_within_bigint"
     assert (
@@ -1214,9 +1189,8 @@ def test_a_venue_whose_rows_are_all_rejected_is_named_in_the_note(con):
     reads a watermark that such a venue has never set, so it was excluded there
     too. A wiki_article that resolves to a DIFFERENT article lands exactly
     there - the realistic hazard, since the API is title-exact and redirects
-    are silent. Every row fails article_matches_request, the other venue
-    dilutes the reject rate below the gate, the run reports `ok`, and the note
-    is empty. It re-quarantines the same window every night, forever.
+    are silent. Every row fails article_matches_request, and with the hold
+    ceiling raised to 1.0 nothing else would name the venue.
     """
 
     def wrong_article(article, start, end):
@@ -1246,7 +1220,7 @@ def test_a_venue_whose_rows_are_all_rejected_is_named_in_the_note(con):
         fetch=wrong_article,
     )
 
-    assert summary.status == "ok"
+    assert summary.status == "degraded"
     assert summary.rows_quarantined > 0
     assert "milford-sound" in summary.note, (
         f"a venue rejecting every row is not named in the note: {summary.note!r}"
@@ -1294,10 +1268,10 @@ def test_one_broken_venue_does_not_deadlock_the_other_seven(con):
     Measured on that rule, five of eight drifting: nights 1-19 dark, then `ok`
     from night 20 with all five still broken.
 
-    The rule now: a venue over the ceiling on its own raw rejections is held for
-    as long as it is broken - quarantined, watermark held, named in the note -
-    and the run is `degraded`, not `ok`. The seven healthy venues load every
-    night, which is what this asserts.
+    The rule now: a venue over the ceiling on its NEW rejections is held that
+    night; after that its watermark stays parked behind the rejected days, and
+    the run is `degraded`, not `ok`, for as long as they are unresolved. The
+    seven healthy venues load every night, which is what this asserts.
     """
 
     def drifted(article, start, end):
@@ -1604,7 +1578,7 @@ def test_accepting_a_day_is_what_lets_a_held_venue_move_again(con):
     ]
     assert bad_days, "nothing to accept"
     for day in bad_days:
-        ingest.resolve(con, "v0", day, ingest.ACCEPTED)
+        ingest.resolve(con, "v0", day, accept=True)
 
     after = ingest.run(con, EIGHT, today=TODAY, backfill_days=30, chunk_days=60, fetch=partly_bad)
 
@@ -1679,10 +1653,11 @@ def test_a_majority_of_broken_venues_does_not_stop_the_pipeline_for_ever(con):
     reason, then green from night 20 with all five venues still broken, because
     by then nothing about them was new.
 
-    The rule now holds each venue on its own raw rejections. The healthy venues
-    are never blocked by the broken ones, and a night with five held venues is
-    never reported as `ok`. The night-by-night version of this lives in
-    tests/test_gate_duration.py; this keeps the thirty-night shape.
+    The rule now holds each venue on its own new rejections, and reports any
+    venue with an unresolved one. The healthy venues are never blocked by the
+    broken ones, and a night with five broken venues is never reported as `ok`.
+    The night-by-night version of this lives in tests/test_gate_duration.py;
+    this keeps the thirty-night shape.
     """
     broken = {f"v{i}" for i in range(5)}  # 5 of 8 - a majority
     state = {"broken": False}
@@ -1755,9 +1730,11 @@ def test_the_rejects_an_abort_left_behind_are_what_lets_the_next_run_through(con
     what this test used to assert.
 
     The rejects are still written, and they are still what an operator reads -
-    but they no longer let anything through by themselves. Night 2 holds the
-    same venues, loads the same healthy ones, and reports the same status.
-    Nothing moves until somebody accepts the days.
+    but they no longer turn the status green by themselves. On night 2 the five
+    are no longer held (nothing about them is new), yet they have nothing clean
+    to load, their watermarks stay parked behind the open rejections, and the
+    status stays `degraded`. Nothing moves until the days load cleanly or
+    somebody accepts them.
     """
 
     def feed(article, start, end):

@@ -19,17 +19,19 @@ a third-party API rate limits you, answers 404 for a quiet week, restates a
 figure it already gave you, or quietly changes its response shape.
 
 ```
-venues.csv  ->  windowed API calls  ->  acceptance criteria  ->  gate  ->  DuckDB
-                (retry / backoff)       (quarantine, not drop)   (abort)
+venues.csv  ->  windowed API calls  ->  acceptance criteria  ->  hold  ->  DuckDB  ->  status
+                (retry / backoff,       (quarantine, not drop)   (per     (one        (ok only if
+                 verify absences)                                 venue)   transaction) nothing is
+                                                                                        unresolved)
 ```
 
 ## Run it
 
 ```bash
-pip install -r requirements.txt
+uv sync                            # or: pip install -e . --group dev  (pip 25.1+)
 
 python demo.py                     # offline, synthetic API, no network needed
-python -m nz_attraction_pageviews  # live, hits the Wikimedia API
+python -m nz_attraction_pageviews --contact you@example.org   # live, hits the Wikimedia API
 pytest -q                          # offline; network calls are stubbed
 ```
 
@@ -108,12 +110,35 @@ Collapsing them here would be the verification layer quietly deciding a quality
 question, and the drift would never be recorded — which is the failure this
 module exists to prevent, arriving by the back door.
 
-**2. Retry 429 and 5xx. Never retry 400.**
+A non-empty 200 used to be the one answer taken at face value, and it is the
+one the watermark trusts most: decision 4 treats a hole *behind* a day that
+arrived as settled-quiet and never asks for it again. So a wide window that
+came back with its first five days and its last one, when a narrower request
+would have returned all thirty, lost 24 days for good — measured against a stub
+API doing exactly that, a 30 day backfill stored 6 days, the watermark stepped
+over the rest, the run said `ok`, and three more nights recovered nothing.
+Now every hole in a direct 200 that has a later day present is re-asked in
+slices of at most seven days, and a slice that comes back empty is subdivided
+like any other empty answer. Days after the last one present are left alone:
+the watermark does not trust those, and they are asked for again next run. A
+200 with no holes still costs one request.
+
+**2. Retry 429, 500, 502, 503 and 504. Never retry 400.**
 A malformed request will be malformed on the retry too, so retrying it only
-burns someone else's rate limit. Backoff honours `Retry-After` when the server
+burns someone else's rate limit. The same goes for 403, 501, 505 and every
+other status not on that list, and for a TLS certificate that fails
+verification. What is retried besides the five statuses: a connection that
+failed or dropped, and a 200 whose body is not JSON at all — a proxy's HTML
+error page, a captive portal, a truncated read. Backoff honours `Retry-After` when the server
 sends one, otherwise `2^attempt` plus jitter. The jitter matters because eight
 venues are fetched in a loop: without it, every retry lands on the same second
 and recreates the burst that caused the throttle.
+
+A transport failure keeps its cause. DNS, a refused connection, TLS and a
+dropped socket all used to surface as `last status 599`; the message now says
+which. Two venues in a row failing to connect before any has succeeded is the
+network, not the venues, so the rest are not attempted: offline, a run used to
+spend two minutes per venue retrying before printing a traceback.
 
 `Retry-After` is treated as a request, not an instruction, and capped at two
 minutes. It is a number chosen by someone else's infrastructure: a misconfigured
@@ -123,9 +148,16 @@ at a few minutes, after which the window fails loudly and the watermark stays
 put — so the days are asked for again tomorrow rather than lost.
 
 A failed venue request is isolated: its earlier windows from that run are
-discarded, its watermark is held and other venues continue. If all requested
-venues fail, the run fails. Schema drift remains fatal across the whole run.
-See `tests/test_venue_failures.py` for HTTP 400 and mid-window regression cases.
+discarded, its watermark is held, it is named in `run_log.note`, the run is
+`degraded`, and other venues continue. The run fails only when every venue in
+`venues.csv` failed; a venue already up to date and not asked about is not a
+failure. Schema drift remains fatal across the whole run. See
+`tests/test_venue_failures.py` for HTTP 400 and mid-window regression cases.
+
+A run has a budget of HTTP calls (`--max-http-requests`, 2,000 by default).
+`run_log.requests` counts windows; `run_log.http_requests` counts calls, and
+the two part company exactly when the API is misbehaving. Past the budget the
+remaining venues are not asked, are named, and keep their watermarks.
 
 **3. A missing field is schema drift, and so is a wrong value.**
 `EXPECTED_FIELDS` is the contract. If the API drops a field, the run fails with
@@ -146,18 +178,26 @@ the URL asked for, and a mismatch stops the run rather than quarantining one
 row, because the request and the response disagree about the question and
 every other row in the payload is equally suspect.
 
+Drift means JSON that parses and breaks the contract. Bytes that are not JSON
+at all — an HTML page from a CDN or a login portal, a body with an integer
+longer than Python will parse, one nested deeper than the parser will go — are
+a transport problem wearing a 200. They used to raise straight out of the
+fetch as drift, `ValueError` or `RecursionError`, and one such response
+stopped all eight venues with nothing loaded. They are retried now, and then
+fail only the venue they came from.
+
 **4. Bad rows are quarantined, not dropped — and the watermark respects that.**
 Every rejected row lands in `quarantine` with the rule it broke and its raw
 payload. "Why is Tuesday missing" is then a SQL query, not an archaeology dig
 through rotated logs. Rules are checked in order, so the rule you see is the
 root cause and not a downstream symptom.
 
-Quarantining is only half of it. The gate below is a rate across the whole run,
-so one venue's bad patch can sit under the threshold and pass: 10 bad days out
-of 240 rows is 4.2%, the run reports `ok`, and that venue loads 20 days instead
-of 30. If its watermark then advanced to the end of the range anyway, those 10
-days would never be requested again and the quarantine would be a record of data
-permanently lost — quarantine with the outcome of a drop.
+Quarantining is only half of it. A venue is held (decision 5) only when its
+newly rejected share is over the ceiling, so a single bad day in a 40 day
+window, 2.5%, does not hold it: the venue's other 39 days load. If its
+watermark then advanced to the end of the range anyway, that day would never
+be requested again and the quarantine would be a record of data permanently
+lost — quarantine with the outcome of a drop.
 
 The same hole opens without any rejected row at all. If the API answers 200 and
 just does not mention the last three days, nothing is quarantined — the
@@ -213,6 +253,16 @@ about days this run requested, and it passed that one long ago. Stopping for it
 would neither recover the day nor stop happening. The cost of all this is that
 every venue re-asks for its last few days each night.
 
+A row rejected by `timestamp_parses` has no day at all. It used to hold the
+whole venue: the watermark never moved again, the range it re-asked grew every
+night until the lookback cap started giving days up, and — because the status
+check looked only at dated rejections — the run said `ok` throughout (199 of
+200 simulated nights). Such a row is now pinned to the window it arrived in,
+and the watermark stops before that window's first day, which is the tightest
+bound the row allows. `resolve <venue> null --accept` releases it, matched by
+rule and window, so accepting one garbage row does not accept the next one to
+arrive in a later window.
+
 **5. A bad venue is held. A bad extract is not a thing the run decides.**
 If a venue's *newly* rejected share is over 5%, that venue is **held**: its
 clean rows are dropped, its watermark stays put, its rejected rows still go to
@@ -251,19 +301,41 @@ green light over a standing fault.
 So there is no whole-run refusal any more. Holding is per venue and that is the
 whole decision.
 
-**What replaced the "bad extract" signal is the status, not a refusal.** A run
-is `degraded` rather than `ok` if any venue is held tonight *or* is still parked
-behind an unresolved rejection from an earlier night, and the note names them.
+**What replaced the "bad extract" signal is the status, not a refusal.** `ok`
+means the warehouse is complete for every venue in `venues.csv`. A run is
+`degraded`, and the note ends `unresolved: <venues>`, if any venue
+
+- was held tonight;
+- still has an open rejection its watermark has not passed — including one
+  first seen tonight, and including a rejection with no parseable day;
+- failed to fetch;
+- gave days up to the lookback cap; or
+- has never produced a single row.
+
 That is the half the old rule got right — a standing problem must not read as a
 clean night — carried by the field that can say so without throwing away seven
-good venues to report one bad one.
+good venues to report one bad one. The status is decided inside the load
+transaction, after tonight's rejections are written. Deciding it before them is
+how a venue's first bad night used to report `ok` and only its second one
+`degraded`.
 
-**Nothing heals itself, and that is deliberate.** A venue stops being *held* on
-the next run, because its rejections are no longer novel, so its clean days load
-again. Its watermark is still parked behind the unresolved day and the run still
-reports `degraded`. `resolve <venue> <date> --accept` is the way out: it records
-that the day is never arriving, and only then may the watermark step over it. A
-decision somebody makes, rather than one the code makes by forgetting.
+It stops being `degraded` when the problem stops. A rejection whose day later
+loads cleanly is marked `superseded` in the same transaction; one behind the
+watermark (a stray date outside the requested window) blocks nothing; one for
+a venue no longer in `venues.csv` is not counted. Before this, a one-night
+upstream glitch kept every later run `degraded` after the day had loaded and
+the watermark had passed it, and the only way out was `--accept` — which
+claims the day is never coming, the opposite of what happened. A status that
+cries wolf every night is a status nobody reads.
+
+**Nothing that is still broken heals itself, and that is deliberate.** A venue
+stops being *held* on the next run, because its rejections are no longer novel,
+so its clean days load again. Its watermark is still parked behind the
+unresolved day and the run still reports `degraded`. Either the day loads
+cleanly on a later run, or `resolve <venue> <date> --accept` records that it is
+never arriving, and only then may the watermark step over it. A decision
+somebody makes, rather than one the code makes by forgetting.
+
 **6. The load is one transaction, and re-running is free.**
 `pageviews` is keyed on `(venue_id, view_date)` and loaded with
 `INSERT OR REPLACE`, so a restated figure overwrites rather than duplicates, and
@@ -271,37 +343,52 @@ running the job twice in a morning is harmless. The whole run commits or none of
 it does, so a crash on venue five cannot leave venues one to four a day ahead of
 the rest.
 
+The warehouse is open only while the run plans and while it loads. DuckDB lets
+one process hold a file for writing, and that lock keeps out every other
+process, readers included, so holding it through the fetch locked out
+`resolve` and any BI tool for as long as the network took.
+
 ## Tables
 
-| Table | What it holds |
+| Table | Columns |
 |---|---|
-| `pageviews` | Clean daily views, keyed `(venue_id, view_date)` |
-| `quarantine` | Rejected rows: the day, the rule they broke, and the raw payload |
-| `watermark` | Last date covered per venue, so the next run resumes there |
-| `run_log` | One row per run: counts, reject rate, status, failure note |
+| `pageviews` | `venue_id`, `article`, `view_date`, `views`, `run_id`, `loaded_at` — keyed `(venue_id, view_date)` |
+| `quarantine` | `run_id`, `venue_id`, `article`, `view_date`, `rule`, `detail`, `raw`, `seen_at`, `resolved_at`, `resolution`, `window_start`, `window_end`, `note` |
+| `watermark` | `venue_id`, `last_date`, `updated_at`, `article` — the title the coverage is for |
+| `run_log` | `run_id`, `started_at`, `finished_at`, `status`, `venues`, `requests`, `rows_fetched`, `rows_loaded`, `rows_quarantined`, `reject_rate`, `note`, `http_requests` |
 
-A failed run still writes to `run_log`, with the reject rate that failed it and
-whatever else it had to say — a run that abandoned days *and then* failed keeps
-both facts in `note`, since the half that is not in the traceback is the half
-you would never otherwise learn. A job that fails silently is worse than one that
-fails loudly.
+Every timestamp is UTC. A warehouse built by an earlier version gains the newer
+columns the first time it is opened.
+
+`quarantine` holds one row per rejected venue, day and rule. Seeing the same
+rejection again does not add a row. `resolution` is `NULL` while the rejection
+is open, `superseded` once the day has loaded cleanly, and `accepted` once an
+operator has decided the day is never arriving; `resolved_at` is when either
+happened. `note` is free text from `resolve --note`, kept whatever happens to
+the row. A superseded rejection that recurs is reopened; an accepted one stays
+accepted.
 
 `quarantine.view_date` is nullable, and the null case is the honest one: a row
 rejected by `timestamp_parses` has no day to record, because the day is what was
-wrong with it. Every other rule fills it in.
+wrong with it. Every other rule fills it in. `window_start` and `window_end`
+say which request each rejection came from, which for a dateless row is the
+only thing that places it at all.
+
+A failed run still writes to `run_log`, with its reject rate and whatever else
+it had to say — a run that abandoned days *and then* failed keeps both facts in
+`note`, since the half that is not in the traceback is the half you would never
+otherwise learn. A job that fails silently is worse than one that fails loudly.
+`requests` counts windows asked for; `http_requests` counts calls, and is
+`NULL` when a test or the demo injects its own fetcher.
 
 ```sql
 -- did anything go wrong lately, and how much
 SELECT started_at, status, rows_loaded, rows_quarantined, reject_rate, note
 FROM run_log ORDER BY started_at DESC LIMIT 10;
 
--- what got rejected and why. Count days, not rows: a venue stuck on a bad day
--- re-quarantines it every run, so count(*) measures how long it has been stuck
--- rather than how much is actually wrong.
-SELECT rule,
-       count(DISTINCT (venue_id, view_date)) AS bad_days,
-       count(*)                              AS rows_seen
-FROM quarantine GROUP BY 1 ORDER BY 2 DESC;
+-- what is still open, and why
+SELECT venue_id, view_date, rule, detail, note
+FROM quarantine WHERE resolution IS NULL ORDER BY venue_id, view_date;
 
 -- which venues are stuck, and how far behind
 SELECT venue_id, last_date FROM watermark ORDER BY last_date;
@@ -309,18 +396,20 @@ SELECT venue_id, last_date FROM watermark ORDER BY last_date;
 
 ## Acceptance criteria
 
-Applied per row, in this order:
+Applied per row, in this order, and then `one_row_per_date` across the response:
 
 | Rule | Rejects |
 |---|---|
 | `article_matches_request` | A response for an article we did not ask for |
 | `timestamp_parses` | Anything that is not `YYYYMMDD00` |
-| `date_in_requested_window` | A date outside the window we requested |
-| `date_not_in_future` | A date after today |
+| `date_in_requested_window` | A date outside the window we requested — including any date in the future, since no window ends later than two days ago |
 | `views_is_integer` | Strings, floats, and `True` (which would otherwise load as 1) |
 | `views_non_negative` | Negative counts |
 | `views_within_bigint` | Counts too large for the column, which would fail the load itself |
-| `one_row_per_date` | A second row for a date already seen in the window |
+| `one_row_per_date` | Every row for a date the response names more than once. Nothing says which figure is right, so none of them loads |
+
+There used to be a `date_not_in_future` rule after the window check. It could
+never fire: a future date is always outside the window first.
 
 ## Testing
 
@@ -338,22 +427,36 @@ order, subdivision recursing only into the pieces that failed, recovered rows
 trimmed to the requested window on both paths, an item that is not an object
 raising schema drift by name, unparseable timestamps left for quarantine rather
 than dropped in the trim, `Retry-After` honoured, backoff growth, give-up
-after max attempts, 400 not retried, both schema drift cases, every acceptance
-rule, window tiling with no gap or overlap, watermark resume, idempotent re-run,
-restatement overwrite, a gate failure leaving the warehouse untouched and still
-logging the rate that failed it, the watermark refusing to step over a
-quarantined day, over a day missing from the tail of a 200, or over a hole in the
-middle of one — while a later run recovers all three — quarantined rows carrying
-the day they belong to (and a null day when that is the defect), an absent day
+after max attempts, 400 and 501 not retried, a TLS certificate failure not
+retried, a transport failure naming its cause, a 200 that is not JSON retried
+and then failing one venue rather than the run, a body that trickles in cut off
+at a deadline, schema drift cases, every acceptance rule that can fire in the
+pipeline, window tiling with no gap or overlap, watermark resume, idempotent
+re-run, restatement overwrite, a held venue leaving the warehouse untouched and
+still logging its reject rate, the watermark refusing to step over a
+quarantined day or over a day missing from the tail of a 200 — while a later run
+recovers both — a hole in the middle of a 200 re-asked in narrow slices before
+the watermark may treat it as quiet, quarantined rows carrying the day they
+belong to (and a null day plus the window when that is the defect), a dateless
+rejection holding the watermark only from its window and released by `resolve
+… null --accept`, an absent day
 trusted once something later arrives or once it is old enough but not before, a
 sparse venue still making progress, the watermark never moving backwards, the
 lookback cap bounding a stuck venue while recording what it gave up on even when
 the run then fails, `Retry-After` capped rather than obeyed when a server asks
-for a day or sends something that is not a finite number, and `venues.csv`
-rejected with a line number for a blank field, a duplicate `venue_id` or a
-missing column while tolerating a BOM and an extra column.
+for a day or sends something that is not a finite number, `venues.csv`
+rejected with a line number for a blank field, a duplicate `venue_id`, a
+missing column or a character no title can contain, while tolerating a BOM, an
+extra column and a trailing blank line, and a changed title re-fetching the
+backfill window. The status has its own tests (`tests/test_status.py`), one per
+way a run can be incomplete and one per way it stops being so; the command line
+is driven end to end with `urlopen` stubbed (`tests/test_cli.py`); and the two
+captured live responses are run through the parser and the acceptance rules, so
+a contract that drifts from what the API actually sends fails offline.
 
-CI runs lint, format check, and tests on Python 3.10 through 3.13.
+CI installs from `uv.lock`, then runs lint, format check, the tests with a 90%
+coverage floor, and a package build, on Python 3.10 through 3.13. A separate
+workflow runs the live smoke test weekly.
 
 ## Limits
 
@@ -380,29 +483,45 @@ CI runs lint, format check, and tests on Python 3.10 through 3.13.
   full — roughly 13 requests where a venue with traffic costs 1. An upstream that
   reports "no data" as `200 {"items": []}` rather than 404 is now verified the
   same way, so a first run against one costs about 1,400 requests for eight
-  venues rather than 24. That is the price of not believing it; a request budget
-  that stops a run rather than a window is the thing this does not have. At eight venues
-  that is affordable; at several hundred it would need a memo of which windows
-  have already been verified empty.
+  venues rather than 24. That is the price of not believing it. The per-run
+  budget (`--max-http-requests`, 2,000) is what stops it running away: past it
+  the remaining venues wait for the next run, named in the note. At several
+  hundred venues this would need a memo of which windows have already been
+  verified empty.
+- Holes in a 200 are verified too, so a sparse venue pays a few extra requests
+  for the holes in whatever range it re-asks. Only holes before the last day
+  that arrived are re-asked, and the watermark does not re-ask days behind it,
+  so the cost is bounded by the unsettled tail except for a venue whose
+  watermark is stuck.
+- Subdivision still goes down to single days, which is what makes a mis-typed
+  title cost ~60 requests per window. Stopping at seven-day slices would cap
+  that at 13, but the live API has refused a 5 and a 7 day window while
+  answering 1 to 3 day ones (decision 1), so a seven-day floor would lose real
+  days to save requests on a typo. The typo is reported instead: see the next
+  point.
 - A typo in `venues.csv` looks exactly like a quiet venue: the article does not
   exist, every width and slice 404s, and the window verifies as genuinely empty.
   A venue that has never produced a single row is therefore named in
-  `run_log.note`, since nothing else in the summary tells the two apart.
+  `run_log.note` and the run is `degraded`, since nothing else in the summary
+  tells the two apart. `python -m nz_attraction_pageviews check-venues` asks
+  MediaWiki about every title directly: missing, redirect, or canonical.
 - The trust line is bounded by the newest day any venue has ever returned. If the
   upstream genuinely publishes nothing at all for a stretch — every venue, every
   day — no watermark advances during it. That is deliberate: the alternative is
   the silent loss it replaced. It does mean a warehouse with a single, very quiet
   venue leans on the calendar line more than a warehouse with eight.
-- `run_log.requests` counts windows asked for, not HTTP calls. Verification can
-  turn one window into several calls, so the two diverge exactly when the API is
-  misbehaving.
+- `run_log.requests` counts windows asked for, `run_log.http_requests` HTTP
+  calls. Verification can turn one window into dozens of calls, so the two
+  diverge exactly when the API is misbehaving.
 - A venue whose bad day never becomes good stops advancing, and then re-asks for
   everything from that day to today — not just the bad day — so both the range and
   the rewrite grow every run. `max_lookback_days` caps that at 180 days. Hitting
   the cap is not free: the span below it is abandoned, which is the same silent
   skip the watermark logic exists to prevent, so it is written to `run_log.note`
-  (`v0: gave up on 12 days`) rather than happening quietly. A stuck venue is a
-  query — `SELECT venue_id, last_date FROM watermark ORDER BY last_date` — not a
+  (`v0: gave up on 12 days`) and the run is `degraded` rather than it happening
+  quietly. A backfill longer than the cap is refused up front rather than cut
+  to it. A stuck venue is a query —
+  `SELECT venue_id, last_date FROM watermark ORDER BY last_date` — not a
   surprise six months later.
 - An empty window advances the watermark only as far as the trust line —
   `today - 7` — and not at all until something, anywhere in the warehouse,
@@ -420,22 +539,33 @@ CI runs lint, format check, and tests on Python 3.10 through 3.13.
 ## Data
 
 Wikimedia Analytics pageviews API, `per-article` daily, `all-access`, `user`
-agent (bots excluded). No API key. Wikimedia asks for a contactable User-Agent,
-set in `nz_attraction_pageviews/client.py` — change it to your own before running
-the live path.
+agent (bots excluded). No API key. Wikimedia asks for a User-Agent that reaches
+whoever is running the job, so a live run needs `--contact` (or `NZAP_CONTACT`),
+an email address or URL, and refuses to start without one. It used to carry the
+author's own address, so anyone running a copy sent requests in the author's name.
 
-Titles are normalised to NFC on read. A macron is one codepoint in NFC and two
+Titles are normalised on read to the spelling MediaWiki uses: NFC, underscores
+for spaces, a capital first letter. A macron is one codepoint in NFC and two
 in NFD; both render as `ū`, macOS text entry and some spreadsheets produce NFD,
 and the API answers in NFC — so an un-normalised `Tūrangi` would quarantine
 every row it ever fetched, under a `detail` reading `got 'Tūrangi', asked for
-'Tūrangi'`.
+'Tūrangi'`. `Sky Tower (Auckland)` typed with spaces would 404 every night.
+A title containing a character no title can contain (`#<>[]{}|`) is refused
+with its line number.
 
 Titles in `venues.csv` must be canonical, not redirects. The pageviews API is
 title-exact and does not follow redirects, so a redirect title returns only the
 traffic that arrived through that redirect — which looks like a plausible number
 rather than an obviously wrong one. `Waitomo_Glowworm_Caves` reports around 175
 views a month; the article it redirects to, `Waitomo_Glowworm_Cave`, reports
-about 2400. Nothing in the pipeline can catch this, because a small number is
-not an invalid one.
+about 2400. The ingest cannot catch this, because a small number is not an
+invalid one; `check-venues` can, by asking MediaWiki. On 2026-09-26 all eight
+titles in `venues.csv` were canonical — `Te_Papa` included, which is the article
+`Museum_of_New_Zealand_Te_Papa_Tongarewa` redirects *to*.
+
+Correcting a title is safe. The watermark records which title its coverage is
+for, so a venue whose title changes re-fetches its backfill window under the
+new one, and the note says that rows older than the window are still the old
+title's.
 
 Data is licensed CC0 by the Wikimedia Foundation.
