@@ -2,8 +2,25 @@
 
 [![CI](https://github.com/Kenchch/nz-attraction-pageviews/actions/workflows/ci.yml/badge.svg)](https://github.com/Kenchch/nz-attraction-pageviews/actions/workflows/ci.yml)
 
-Incremental daily Wikipedia pageviews for eight New Zealand attractions, stored
-in DuckDB. For readers studying reliable API ingestion and recovery from missing data.
+How much online attention eight New Zealand attractions get each day,
+collected nightly from Wikipedia's pageview API into DuckDB. A day that fails,
+arrives late or arrives incomplete is retried or held back, never silently
+lost. For readers studying reliable API ingestion and recovery from missing data.
+
+```mermaid
+flowchart LR
+    wmr[("watermark<br/>per venue")] -->|"read: resume from<br/>the day after"| fetch["fetch windows<br/>retry + backoff,<br/>re-ask empty or partial"]
+    fetch -->|request fails| skip["venue set aside,<br/>watermark untouched"]
+    fetch --> rules{"row acceptance<br/>rules"}
+    rules -->|reject| tx
+    rules -->|accept| gate{"venue's new<br/>reject rate"}
+    gate -->|over ceiling| hold["venue held,<br/>watermark untouched"]
+    gate -->|within| tx[["one DuckDB<br/>transaction"]]
+    tx --> data[("daily pageviews")]
+    tx --> quar[("quarantine<br/>raw JSON kept")]
+    tx -->|"advance only past<br/>published, resolved days"| wmw[("watermark<br/>per venue")]
+    tx -.->|"any error: roll back,<br/>no watermark moves"| wmw
+```
 
 ## What I built
 
@@ -26,8 +43,11 @@ in DuckDB. For readers studying reliable API ingestion and recovery from missing
 | Releasing a hold | A day that later loads cleanly releases itself; `resolve … --accept` records that a day is never arriving |
 | Idempotence | Re-requested days are overwritten; days behind settled watermarks are not re-fetched |
 
-The offline demo loads 720 rows, then 24 new rows on a run three days later:
-744 stored rows and zero duplicate `(venue_id, view_date)` pairs.
+The offline demo replays two nights: a 90-day backfill of 720 rows, then a run
+three days later that asks only for the three days it has not seen, 24 rows
+across the eight venues. It ends with
+744 stored rows and zero duplicate `(venue_id, view_date)` pairs, so resuming
+from the watermark neither skipped nor repeated a day.
 
 ## Run it
 
@@ -97,6 +117,23 @@ WHERE status <> 'ok';
 - Requests are sequential; this is an eight-venue pipeline with no orchestrator.
 - Notes never release anything; no automatic historical backfill sweep is implemented.
 
+## What this would need in production
+
+Not built here; listed so the gaps are explicit.
+
+- **Someone who gets paged.** Failures leave an exit code, a `degraded` status
+  and quarantined rows, and the query above counts bad nights, but nothing
+  sends them anywhere. Exit codes 3, 5 and 6, a repeated 4, or three non-`ok`
+  runs in a row should reach an on-call channel, and quarantine needs an owner who reviews it.
+- **A copy of the warehouse elsewhere.** Rows, quarantine and watermarks are
+  written in one transaction, so a crash cannot leave the watermark ahead of
+  the data. But they share one DuckDB file: lose it and the only recovery is
+  re-fetching from Wikimedia, bounded by the lookback cap (180 days by default)
+  and the request budget. It needs a nightly copy off the machine.
+- **A restatement sweep.** Once a watermark passes a day, that day is never
+  asked for again, so a later Wikimedia correction is missed. A periodic
+  re-fetch of the last few weeks of settled days would pick those up.
+
 ## Data
 
 Wikimedia Analytics daily `per-article`, `all-access`, `user` pageviews (CC0).
@@ -145,9 +182,11 @@ weekly.
 
 ## How this was built
 
-I set the problem, the data contracts and the quality rules, ran the benchmarks
-and reviewed every diff; Claude Code and OpenAI Codex drafted code, refactored
-and scaffolded tests. On 6 September 2026 the `Co-Authored-By` trailers were
-removed from the commits made before that date. Commits since then keep them,
-so the history records AI involvement from that point on, and each pull request
-states its own in the template.
+I used Claude Code and OpenAI Codex as drafting tools. The problem, the data
+contracts and the quality rules are mine, and so is the review: every generated
+change was read and run before it was committed. The tools drafted code,
+refactored and scaffolded tests.
+
+Commits made before 6 September 2026 carried `Co-Authored-By` trailers naming
+these tools. They were removed when I rewrote that history; most commits since
+then carry them, and each pull request states its own AI involvement.
