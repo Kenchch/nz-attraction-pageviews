@@ -54,6 +54,39 @@ Exit codes: `0` ok or degraded (read the status line), `1` nothing matched
 configuration (venues.csv, parameters, contact, missing warehouse), `4` every
 venue failed, `5` schema drift, `6` the warehouse could not be opened or written.
 
+## Running it nightly
+
+The command is idempotent, so a scheduler only has to run it once a day and act
+on the exit code:
+
+| Exit | Meaning | What to do |
+|---|---|---|
+| `0` | Ran. Status `ok` or `degraded` | Nothing tonight; see the query below for standing problems |
+| `4` | Every venue failed (network, HTTP, request budget) | Let the next night retry; alert if it repeats |
+| `6` | Warehouse locked or unwritable | Retry later; nothing was loaded, so a retry is safe |
+| `3`, `5` | Configuration or schema drift | A person has to look; retrying will not help |
+
+cron, at 03:30 UTC (after Wikimedia's daily publication):
+
+```bash
+30 3 * * * cd /srv/nz-attraction-pageviews && NZAP_CONTACT=ops@example.org .venv/bin/nz-attraction-pageviews --db warehouse.duckdb >> ingest.log 2>&1
+```
+
+Windows Task Scheduler:
+
+```bash
+schtasks /Create /SC DAILY /ST 15:30 /TN nz-attraction-pageviews /TR "cmd /c cd /d D:\nz-attraction-pageviews && .venv\Scripts\nz-attraction-pageviews --contact ops@example.org --db warehouse.duckdb >> ingest.log 2>&1"
+```
+
+`degraded` exits 0 on purpose: the run did its job, and an alert that fires on
+every standing fault gets muted. Alert instead when it persists — this counts
+how many of the last three runs were not `ok`, and 3 means three nights running:
+
+```sql
+SELECT count(*) FROM (SELECT status FROM run_log ORDER BY started_at DESC LIMIT 3)
+WHERE status <> 'ok';
+```
+
 ## Limits
 
 - Pageviews measure online attention, not visitor attendance.
@@ -70,6 +103,7 @@ Wikimedia Analytics daily `per-article`, `all-access`, `user` pageviews (CC0).
 No API key is required.
 
 [Design notes, table schemas and detailed recovery evidence](docs/DESIGN.md) ·
+[Changelog and upgrade notes](CHANGELOG.md) ·
 [HTTP isolation regression tests](tests/test_venue_failures.py)
 
 ## Reviewing quarantine

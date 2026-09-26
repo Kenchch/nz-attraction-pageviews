@@ -7,7 +7,7 @@ from datetime import date, timedelta
 import pytest
 from helpers import TODAY, VENUES, Recorder
 
-from nz_attraction_pageviews import client, ingest
+from nz_attraction_pageviews import client, ingest, store
 
 
 @pytest.fixture
@@ -920,13 +920,13 @@ def test_an_oversized_views_value_is_quarantined_without_taking_the_run_down(con
 def test_the_run_log_lands_in_the_same_transaction_as_the_data(con, monkeypatch):
     """Written afterwards it could be lost while the data survived, leaving rows
     no run claims to have loaded."""
-    original = ingest._write_run_log
+    original = store.write_run_log
 
     def explode(*args, **kwargs):
         original(*args, **kwargs)
         raise RuntimeError("crash between the data and its log")
 
-    monkeypatch.setattr(ingest, "_write_run_log", explode)
+    monkeypatch.setattr(store, "write_run_log", explode)
 
     with pytest.raises(RuntimeError):
         ingest.run(con, VENUES, today=TODAY, backfill_days=5, chunk_days=30, fetch=Recorder())
@@ -1142,7 +1142,7 @@ def test_cancelling_mid_write_still_rolls_back(con, monkeypatch, cancellation):
     def cancel(*a, **k):
         raise cancellation("user pressed Ctrl-C")
 
-    monkeypatch.setattr(ingest, "_write_run_log", cancel)
+    monkeypatch.setattr(store, "write_run_log", cancel)
 
     with pytest.raises(cancellation):
         ingest.run(con, VENUES, today=TODAY, backfill_days=5, chunk_days=30, fetch=Recorder())
