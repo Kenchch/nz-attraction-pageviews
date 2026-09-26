@@ -5,13 +5,10 @@ Two decisions worth defending in a review:
 - A row that breaks a rule is quarantined, not dropped. The row keeps the name
   of the rule it broke, so "why is Tuesday missing" is answerable from a table
   rather than from a log file that has rotated away.
-- The gate is checked before anything is written, and it is checked per venue.
-  A venue whose newly rejected days are over the ceiling is held: its watermark
-  stays put and nothing of it is loaded, so last night's data for it stays
-  intact. Held venues do not block the others -- a partial run is better than no
-  run, because every venue's own watermark already refuses to step over the days
-  it has not resolved. A run carrying any unresolved rejection is reported as
-  `degraded` rather than `ok`.
+- Nothing here decides whether a venue loads. That is `ingest._apply_gate`,
+  which holds a venue whose newly rejected share is over the ceiling, and
+  `ingest.run`, which reports any venue with an unresolved rejection as
+  `degraded`.
 """
 
 from __future__ import annotations
@@ -19,19 +16,18 @@ from __future__ import annotations
 import json
 import re
 import unicodedata
+from collections import Counter
 from dataclasses import dataclass
 from datetime import date, datetime
 
-# `pageviews.views` is a BIGINT. A larger int passes every other rule, becomes a
-# CleanRow, and then fails inside the driver as an unnamed conversion error -
-# which aborts the load for *every* venue, not just the one that sent it, and
-# does it again every night because no watermark advanced. A row the warehouse
-# cannot hold is a bad row, so it is rejected here like any other.
+# `pageviews.views` is a BIGINT. A larger int would pass every other rule and
+# then fail inside the driver, aborting the load for every venue. A row the
+# warehouse cannot hold is a bad row, so it is rejected here like any other.
 VIEWS_MAX = 2**63 - 1
 
-
-class QualityGateFailed(RuntimeError):
-    """Reject rate above the configured threshold. Nothing was loaded."""
+# Characters MediaWiki never allows in a title. One of these in venues.csv is a
+# typo, not an article, and `|` would also split a batched title lookup.
+FORBIDDEN_TITLE_CHARS = frozenset("#<>[]{}|")
 
 
 @dataclass(frozen=True)
@@ -50,27 +46,27 @@ class BadRow:
     rule: str
     detail: str
     raw: str
+    # The window the row arrived in. For a row with no parseable day this is
+    # the only thing that says which days it might have belonged to, so the
+    # watermark stops before `window_start` rather than freezing the venue.
+    window_start: date | None = None
+    window_end: date | None = None
 
 
 def parse_timestamp(value) -> date:
-    """Wikimedia sends daily timestamps as YYYYMMDD00."""
+    """Wikimedia sends daily timestamps as YYYYMMDD00.
+
+    The trailing 00 is the "daily": an hourly stamp such as 2026031012 would
+    otherwise load as that day's total when it is one hour of it.
+    """
     text = str(value)
-    # The trailing 00 is the "daily" in a daily timestamp, and checking only for
-    # ten digits let an hourly stamp through: 2026031012 parsed as 10 March and
-    # loaded as that day's total when it is one hour of it. `one_row_per_date`
-    # would catch a second hour for the same day, but the first one arrives
-    # looking exactly like a legitimate daily figure.
     if not re.fullmatch(r"\d{8}00", text):
         raise ValueError(f"expected Wikimedia daily timestamp YYYYMMDD00, got {value!r}")
     return datetime.strptime(text[:8], "%Y%m%d").date()
 
 
 def _date_or_none(item: dict) -> date | None:
-    """The row's day, or None when that is exactly what is wrong with it.
-
-    A row rejected by `timestamp_parses` has no day to record, which is why
-    `quarantine.view_date` is nullable.
-    """
+    """The row's day, or None when that is exactly what is wrong with it."""
     try:
         return parse_timestamp(item["timestamp"])
     except (ValueError, KeyError, TypeError):
@@ -84,34 +80,51 @@ def check_window(
     article: str,
     start: date,
     end: date,
-    today: date,
 ) -> tuple[list[CleanRow], list[BadRow]]:
-    """Apply every rule to every row. Returns (clean, quarantined)."""
-    clean: list[CleanRow] = []
+    """Apply every rule to every row. Returns (clean, quarantined).
+
+    Two passes, because `one_row_per_date` is a property of the response rather
+    than of a row. When one response names a day twice with different figures,
+    nothing says which is right, so neither is loaded: taking the first would
+    put a possibly wrong number in `pageviews` and quarantine only the other.
+    """
     bad: list[BadRow] = []
-    seen: dict[date, int] = {}
+    candidates: list[tuple[dict, date]] = []
+
+    def reject(item: dict, rule: str, detail: str) -> None:
+        bad.append(
+            BadRow(
+                venue_id,
+                article,
+                _date_or_none(item),
+                rule,
+                detail,
+                json.dumps(item, ensure_ascii=False),
+                start,
+                end,
+            )
+        )
 
     for item in items:
-        broken = _first_broken_rule(
-            item, article=article, start=start, end=end, today=today, seen=seen
-        )
+        broken = _first_broken_rule(item, article=article, start=start, end=end)
         if broken is not None:
-            rule, detail = broken
-            bad.append(
-                BadRow(
-                    venue_id,
-                    article,
-                    _date_or_none(item),
-                    rule,
-                    detail,
-                    json.dumps(item, ensure_ascii=False),
-                )
-            )
-            continue
+            reject(item, *broken)
+        else:
+            candidates.append((item, parse_timestamp(item["timestamp"])))
 
-        view_date = parse_timestamp(item["timestamp"])
-        seen[view_date] = item["views"]
-        clean.append(CleanRow(venue_id, article, view_date, item["views"]))
+    per_day = Counter(view_date for _, view_date in candidates)
+    clean: list[CleanRow] = []
+    for item, view_date in candidates:
+        if per_day[view_date] > 1:
+            figures = [i["views"] for i, d in candidates if d == view_date]
+            reject(
+                item,
+                "one_row_per_date",
+                f"{view_date} appears {per_day[view_date]} times with views {figures}; "
+                f"none of them was loaded",
+            )
+        else:
+            clean.append(CleanRow(venue_id, article, view_date, item["views"]))
 
     return clean, bad
 
@@ -119,25 +132,28 @@ def check_window(
 def normalise_title(title: str) -> str:
     """One spelling of a title, so two spellings of the same one compare equal.
 
-    A macron can be written as one codepoint (NFC, `\\u016b`) or as `u` plus a
-    combining macron (NFD). Both render as `ū`, and macOS text entry and some
-    spreadsheets produce NFD, so a hand-edited `venues.csv` can disagree with the
-    API's NFC for a title that looks identical in every editor. Without this, a
-    venue like `Tūrangi` quarantines 100% of its rows for ever, under a `detail`
-    that reads `got 'Turangi', asked for 'Turangi'`.
+    - NFC: a macron can be one codepoint or `u` plus a combining macron. Both
+      render as `ū`; the API answers in NFC, and macOS text entry and some
+      spreadsheets produce NFD.
+    - Underscores for spaces, and a capital first letter: MediaWiki's own
+      canonical form, which the title-exact pageviews API expects. Without it
+      `Sky Tower (Auckland)` 404s every night, and `milford_Sound` fetches rows
+      that all fail `article_matches_request`.
     """
-    return unicodedata.normalize("NFC", title)
+    text = unicodedata.normalize("NFC", title).strip().replace(" ", "_")
+    return text[:1].upper() + text[1:]
+
+
+def invalid_title_chars(title: str) -> list[str]:
+    """Characters MediaWiki does not allow in a title, in the order they appear."""
+    return sorted(set(title) & FORBIDDEN_TITLE_CHARS, key=title.index)
 
 
 def _same_title(got, asked: str) -> bool:
     """Compare titles, tolerating an `article` that is not a string at all.
 
-    `!=` accepted anything; `unicodedata.normalize` raises TypeError on a non-str,
-    and `_parse` checks only that the field is *present*. So a drifted `null` or
-    number here would abort the whole run - every venue, every night, since no
-    watermark advances - which is the failure `views_within_bigint` exists to
-    prevent, two rules further down. A row with a non-string article is simply a
-    row that does not match, and is quarantined like any other mismatch.
+    `_parse` checks only that the field is present, so a drifted null or number
+    can arrive here. That is a row that does not match, not a reason to raise.
     """
     if not isinstance(got, str) or not isinstance(asked, str):
         return got == asked
@@ -147,10 +163,8 @@ def _same_title(got, asked: str) -> bool:
 def _title_mismatch_detail(got, asked: str) -> str:
     """Name the difference, adding the escaped form when it may not be visible.
 
-    Codepoints can differ while rendering identically, which produced quarantine
-    rows reading `got 'Tūrangi', asked for 'Tūrangi'` - true, and useless. Any
-    non-ASCII in play and the escapes go in too, so the row can be diagnosed from
-    the table rather than by pasting it into a hex editor.
+    Codepoints can differ while rendering identically, and `got 'Tūrangi',
+    asked for 'Tūrangi'` is true and useless.
     """
     plain = f"got {got!r}, asked for {asked!r}"
     if not isinstance(got, str) or not isinstance(asked, str):
@@ -168,13 +182,16 @@ def _first_broken_rule(
     article: str,
     start: date,
     end: date,
-    today: date,
-    seen: dict[date, int],
 ) -> tuple[str, str] | None:
     """Return (rule, detail) for the first rule this row breaks, or None if it is clean.
 
     Rules are ordered cheapest and most fundamental first, so the reported rule is
-    the root cause rather than a downstream symptom.
+    the root cause rather than a downstream symptom. `one_row_per_date` is not
+    here: it needs the whole response, so `check_window` applies it last.
+
+    There is no "date in the future" rule. The window never ends later than
+    `today - PUBLICATION_LAG_DAYS`, so a future date always fails
+    `date_in_requested_window` first.
     """
     if not _same_title(item["article"], article):
         return "article_matches_request", _title_mismatch_detail(item["article"], article)
@@ -187,9 +204,6 @@ def _first_broken_rule(
     if not (start <= view_date <= end):
         return "date_in_requested_window", f"{view_date} outside {start}..{end}"
 
-    if view_date > today:
-        return "date_not_in_future", f"{view_date} is after {today}"
-
     views = item["views"]
     if isinstance(views, bool) or not isinstance(views, int):
         return "views_is_integer", f"got {type(views).__name__} {views!r}"
@@ -200,20 +214,11 @@ def _first_broken_rule(
     if views > VIEWS_MAX:
         return "views_within_bigint", f"got {views}, above the {VIEWS_MAX} the column holds"
 
-    if view_date in seen:
-        return "one_row_per_date", f"{view_date} already seen with {seen[view_date]} views"
-
     return None
 
 
 def reject_rate(fetched: int, quarantined: int) -> float:
-    """The run's reject rate. Separate from the gate so it can be recorded first.
-
-    `run_log.reject_rate` is the column you reach for when a run has gone wrong,
-    so it must be written before the gate is allowed to raise. Deriving it from
-    the gate's return value meant a failed run logged 0.0 - zero in the one case
-    the number was worth having.
-    """
+    """Share of fetched rows that were rejected; 0.0 when nothing was fetched."""
     if fetched == 0:
         return 0.0
     return quarantined / fetched

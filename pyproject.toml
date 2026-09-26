@@ -1,16 +1,29 @@
 [build-system]
-requires = ["setuptools>=64"]
+# 77 for the SPDX `license` string below.
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "nz-attraction-pageviews"
-version = "0.1.0"
+dynamic = ["version"]
 description = "Incremental API ingest of Wikipedia pageviews for NZ visitor attractions"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Feng Jiang" }]
 requires-python = ">=3.10"
 dependencies = ["duckdb>=1.0,<2"]
 
-[project.optional-dependencies]
-dev = ["pytest>=8,<10", "ruff>=0.16,<0.17"]
+[project.urls]
+Repository = "https://github.com/Kenchch/nz-attraction-pageviews"
+
+[project.scripts]
+nz-attraction-pageviews = "nz_attraction_pageviews.__main__:main"
+
+# A dependency group rather than an extra, so `uv sync` installs it by default
+# and it never ships as part of the package. pip 25.1+: `pip install --group dev`.
+[dependency-groups]
+dev = ["pytest>=8,<10", "pytest-cov>=5,<8", "ruff>=0.16,<0.17"]
 
 # Named explicitly rather than left to auto-discovery. When the package was a
 # directory called `src`, setuptools read it as a src-layout root and built a
@@ -19,12 +32,21 @@ dev = ["pytest>=8,<10", "ruff>=0.16,<0.17"]
 [tool.setuptools]
 packages = ["nz_attraction_pageviews"]
 
+# One place for the version: the User-Agent reads the same attribute.
+[tool.setuptools.dynamic]
+version = { attr = "nz_attraction_pageviews.__version__" }
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 markers = ["live: opt-in Wikimedia network smoke test"]
 # Put the project root on sys.path so `pytest` works, not just `python -m pytest`
 # (the -m form adds the working directory for you; the bare command does not).
-pythonpath = ["."]
+# `tests` is there for tests/helpers.py, so the suite collects under any
+# --import-mode, not only the default prepend one.
+pythonpath = [".", "tests"]
+
+[tool.coverage.run]
+source = ["nz_attraction_pageviews"]
 
 [tool.ruff]
 line-length = 100

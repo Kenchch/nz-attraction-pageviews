@@ -12,7 +12,6 @@ from nz_attraction_pageviews import quality
 ARTICLE = "Milford_Sound"
 START = date(2026, 1, 1)
 END = date(2026, 1, 31)
-TODAY = date(2026, 2, 10)
 
 
 def item(timestamp="2026010100", views=120, article=ARTICLE):
@@ -29,7 +28,7 @@ def item(timestamp="2026010100", views=120, article=ARTICLE):
 
 def check(items):
     return quality.check_window(
-        items, venue_id="milford-sound", article=ARTICLE, start=START, end=END, today=TODAY
+        items, venue_id="milford-sound", article=ARTICLE, start=START, end=END
     )
 
 
@@ -77,10 +76,26 @@ def test_wrong_article_quarantined():
     assert bad[0].rule == "article_matches_request"
 
 
-def test_duplicate_date_keeps_first_quarantines_second():
+def test_a_duplicated_date_loads_neither_row():
+    """Two figures for one day and nothing to say which is right. Loading the
+    first put a possibly wrong number in `pageviews` and quarantined only the
+    other, so both are quarantined and the day is left for the watermark."""
     clean, bad = check([item(views=100), item(views=999)])
-    assert [r.views for r in clean] == [100]
-    assert bad[0].rule == "one_row_per_date"
+    assert clean == []
+    assert [r.rule for r in bad] == ["one_row_per_date", "one_row_per_date"]
+    assert "100" in bad[0].detail and "999" in bad[0].detail
+
+
+def test_a_duplicated_date_does_not_take_its_neighbours_with_it():
+    clean, bad = check([item("2026010100"), item("2026010200", views=5), item("2026010200")])
+    assert [r.view_date for r in clean] == [date(2026, 1, 1)]
+    assert {r.view_date for r in bad} == {date(2026, 1, 2)}
+
+
+def test_a_rejected_row_records_the_window_it_arrived_in():
+    """A row with no parseable day has nothing else to place it by."""
+    _, bad = check([item(timestamp="garbage")])
+    assert (bad[0].view_date, bad[0].window_start, bad[0].window_end) == (None, START, END)
 
 
 def test_quarantined_row_keeps_the_raw_payload():
@@ -138,7 +153,7 @@ def test_a_title_differing_only_by_unicode_form_matches():
     assert nfd != nfc, "the two forms really are different strings"
 
     clean, bad = quality.check_window(
-        [item(article=nfd)], venue_id="turangi", article=nfc, start=START, end=END, today=TODAY
+        [item(article=nfd)], venue_id="turangi", article=nfc, start=START, end=END
     )
     assert bad == [], "the same title in two encodings is the same title"
     assert clean[0].views == 120
@@ -147,7 +162,7 @@ def test_a_title_differing_only_by_unicode_form_matches():
 def test_a_non_ascii_title_mismatch_shows_the_escaped_form():
     """`got 'Tūrangi', asked for 'Tūrangi'` is a true and useless quarantine row."""
     _, bad = quality.check_window(
-        [item(article="Tūrangi")], venue_id="v", article="Taupō", start=START, end=END, today=TODAY
+        [item(article="Tūrangi")], venue_id="v", article="Taupō", start=START, end=END
     )
     assert bad[0].rule == "article_matches_request"
     assert "\\u016b" in bad[0].detail, bad[0].detail
@@ -161,18 +176,31 @@ def test_a_digit_timestamp_of_the_wrong_length_is_rejected():
         quality.parse_timestamp("202601")
 
 
-def test_the_first_rule_reported_is_the_root_cause():
-    """A row outside the window *and* in the future is out of window first."""
-    clean, bad = quality.check_window(
-        [item(timestamp="2026061500")],
-        venue_id="v",
-        article=ARTICLE,
-        start=START,
-        end=END,
-        today=date(2026, 2, 1),
-    )
+def test_a_future_date_is_out_of_window():
+    """There is no separate future-date rule: the window always ends before
+    today, so a future day is outside it and reported as that."""
+    clean, bad = check([item(timestamp="2099061500")])
     assert clean == []
     assert bad[0].rule == "date_in_requested_window"
+
+
+@pytest.mark.parametrize(
+    "written,canonical",
+    [
+        ("Sky Tower (Auckland)", "Sky_Tower_(Auckland)"),
+        ("milford_Sound", "Milford_Sound"),
+        ("  Te_Papa ", "Te_Papa"),
+    ],
+)
+def test_titles_are_normalised_to_the_mediawiki_spelling(written, canonical):
+    """The pageviews API is title-exact: a space 404s every night, and a
+    lower-case first letter fetches rows that all fail article_matches_request."""
+    assert quality.normalise_title(written) == canonical
+
+
+def test_characters_no_title_can_contain_are_found():
+    assert quality.invalid_title_chars("Te_Papa#History") == ["#"]
+    assert quality.invalid_title_chars("Sky_Tower_(Auckland)") == []
 
 
 def test_a_non_string_article_is_quarantined_not_raised():

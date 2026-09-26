@@ -684,30 +684,36 @@ def test_a_top_level_json_that_is_not_an_object_is_named_drift():
         b"\x80\x81\x82",  # not JSON and not UTF-8
     ],
 )
-def test_a_body_that_is_not_utf8_json_is_named_drift(body):
-    """json.loads on bytes sniffs the encoding and copes with a leading BOM, so
-    only the first of these surfaced as a JSONDecodeError and looked handled.
-    The other two raised a bare UnicodeDecodeError out of _parse, naming neither
-    the article nor the contract."""
-    with pytest.raises(client.SchemaDriftError, match="UTF-8 JSON"):
+def test_a_body_that_is_not_utf8_json_is_malformed_not_drift(body):
+    """Bytes that are not JSON at all are a transport problem - a proxy's error
+    page, a garbled read - not a change in the API's contract. They are named,
+    and they are an ApiError, so they fail one venue rather than the run."""
+    with pytest.raises(client.MalformedResponse, match="UTF-8 JSON"):
         client._parse(body, "Te_Papa")
+    assert issubclass(client.MalformedResponse, client.ApiError)
+    assert not issubclass(client.MalformedResponse, client.SchemaDriftError)
 
 
 class _Stream:
     """Minimal stand-in for the object urlopen yields.
 
-    read(n) honours n, and close() is recorded - a response that is never
-    closed is a socket held until the garbage collector gets to it.
+    read(n) honours n and advances, `asked` totals what was asked for, and
+    close() is recorded - a response that is never closed is a socket held
+    until the garbage collector gets to it.
     """
 
     def __init__(self, body: bytes):
         self.body = body
-        self.asked = None
+        self.position = 0
+        self.asked = 0
         self.closed = False
 
     def read(self, n: int | None = None) -> bytes:
-        self.asked = n
-        return self.body if n is None else self.body[:n]
+        n = len(self.body) - self.position if n is None else n
+        self.asked += n
+        chunk = self.body[self.position : self.position + n]
+        self.position += len(chunk)
+        return chunk
 
     def close(self) -> None:
         self.closed = True
@@ -734,7 +740,7 @@ def test_a_body_over_the_limit_is_refused_rather_than_truncated():
     stream = _Stream(b"x" * (client.MAX_RESPONSE_BYTES + 1))
     with pytest.raises(client.ApiError, match="exceeds"):
         client._read_bounded(stream, "https://example.invalid/big")
-    # One byte more than the limit is requested, so "at" and "over" differ.
+    # One byte more than the limit is requested in all, so "at" and "over" differ.
     assert stream.asked == client.MAX_RESPONSE_BYTES + 1
 
 
@@ -823,6 +829,8 @@ def test_a_truncated_error_body_is_also_a_transport_failure(monkeypatch):
 
         def read(self, n=None):
             raise http.client.IncompleteRead(b"")
+
+        read1 = read
 
     exc = urllib.error.HTTPError("u", 500, "boom", {}, _Cut())
 

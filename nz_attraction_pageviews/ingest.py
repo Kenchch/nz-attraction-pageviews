@@ -3,29 +3,41 @@
 Shape of a run:
 
     read venues.csv
-      -> per venue, work out the start date from its watermark
-      -> split the range into fixed windows (this API's version of pagination)
-      -> fetch, apply acceptance criteria
-      -> check the gate across the whole run
-      -> load, quarantine, advance watermarks, write the run log
+      -> plan: per venue, the start date from its watermark        (reads the warehouse)
+      -> fetch: split each range into windows, fetch, apply the    (no warehouse connection)
+         acceptance criteria; a venue whose request fails is set
+         aside with its watermark untouched
+      -> hold any venue whose NEW rejections are over the ceiling
+      -> load: rows, quarantine, watermarks, status, run log       (one transaction)
 
 The load is a single transaction. Either the whole run lands or none of it does,
 so a crash halfway through eight venues cannot leave three venues a day ahead of
-the other five.
+the other five. `run_at` opens the warehouse only for the plan and the load, so
+the minutes spent on the network do not lock out `resolve` or a BI reader.
+
+The status is `ok` only when nothing is unresolved: no venue failed, was held,
+gave up days to the lookback cap, has never produced a row, or still has an
+open rejection its watermark has not passed. Otherwise it is `degraded`.
 """
 
 from __future__ import annotations
 
+import contextlib
 import csv
+import functools
+import logging
 import math
 import uuid
-from dataclasses import dataclass
+from collections.abc import Callable, Iterator
+from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 import duckdb
 
 from . import client, quality
+
+log = logging.getLogger(__name__)
 
 UTC = timezone.utc  # datetime.UTC only exists from 3.11; this keeps 3.10 working
 
@@ -34,11 +46,20 @@ DEFAULT_BACKFILL_DAYS = 90
 DEFAULT_MAX_REJECT_RATE = 0.05
 
 # A venue whose watermark is stuck on a bad day asks for everything from that
-# day to today, every run, so the range and the rewrite grow without bound. This
-# caps it. Hitting the cap means giving up on the days below it, so it is not
-# free: the skipped span is written to `run_log.note` rather than passed over
-# quietly. 180 days is long enough that only a genuinely stuck venue reaches it.
+# day to today, every run. This caps it. Hitting the cap means giving up on the
+# days below it, so the venue is named in `run_log.note` and the run is
+# `degraded`, rather than the days passing over quietly.
 DEFAULT_MAX_LOOKBACK_DAYS = 180
+
+# One run's ceiling on HTTP calls. A normal night is a few dozen; a first
+# backfill against an upstream answering `200 {"items": []}` everywhere is about
+# 1,400 (see DESIGN.md, Limits). Past this the remaining venues are not asked,
+# are named, and keep their watermarks.
+DEFAULT_MAX_HTTP_REQUESTS = 2000
+
+# Upper bound for any day-count parameter. Ten years is past anything useful and
+# short of the date arithmetic overflowing.
+MAX_DAYS = 3650
 
 # The API publishes with a lag. Asking for yesterday usually returns nothing,
 # which is not an error but does waste a request on every run.
@@ -46,18 +67,18 @@ PUBLICATION_LAG_DAYS = 2
 
 # How old an absent day must be before we believe it was genuinely quiet.
 #
-# The API omits days with no traffic rather than sending a zero, so an absent day
-# means either "nobody looked" or "not published yet" - and no amount of asking
-# can tell those apart, because an unpublished day 404s at every width and every
-# slice just like a quiet one. Only time separates them. Below this age an absent
-# day is treated as unsettled and re-asked next run; above it, as quiet.
-#
-# The cost is that every venue re-asks for its last few days each night. The
-# alternative is picking one meaning and being silently wrong: believing "quiet"
-# loses days whenever the lag runs long, and believing "unpublished" strands any
-# venue quiet enough to have a gap - measured against the live API,
-# `Te_Rerenga_Wairua` has 74 absent days in 90.
+# The API omits days with no traffic rather than sending a zero, so an absent
+# day means either "nobody looked" or "not published yet", and no amount of
+# asking can tell those apart. Only time separates them. Below this age an
+# absent day is unsettled and re-asked next run; above it, quiet.
 TRUST_LAG_DAYS = 7
+
+# Two venues in a row failing to connect, before any venue has succeeded, is
+# the network rather than the venues. The rest are not attempted.
+TRANSPORT_BREAKER = 2
+
+ACCEPTED = "accepted"  # an operator decided the day is never arriving
+SUPERSEDED = "superseded"  # the day later loaded cleanly
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS pageviews (
@@ -71,22 +92,28 @@ CREATE TABLE IF NOT EXISTS pageviews (
 );
 
 CREATE TABLE IF NOT EXISTS quarantine (
-    run_id     VARCHAR NOT NULL,
-    venue_id   VARCHAR NOT NULL,
-    article    VARCHAR NOT NULL,
-    -- Nullable on purpose: a row rejected by `timestamp_parses` has no day to
-    -- record. That is the one case where "which Tuesday" has no answer.
-    view_date  DATE,
-    rule       VARCHAR NOT NULL,
-    detail     VARCHAR,
-    raw        VARCHAR,
-    seen_at    TIMESTAMP NOT NULL  -- UTC
+    run_id       VARCHAR NOT NULL,
+    venue_id     VARCHAR NOT NULL,
+    article      VARCHAR NOT NULL,
+    -- NULL only for a `timestamp_parses` rejection, which has no day. The
+    -- window it arrived in is the nearest thing it has to one.
+    view_date    DATE,
+    rule         VARCHAR NOT NULL,
+    detail       VARCHAR,
+    raw          VARCHAR,
+    seen_at      TIMESTAMP NOT NULL,  -- UTC
+    resolved_at  TIMESTAMP,           -- UTC; set with `resolution`
+    resolution   VARCHAR,             -- NULL (open), 'accepted' or 'superseded'
+    window_start DATE,
+    window_end   DATE,
+    note         VARCHAR              -- the operator's annotation, kept across reopening
 );
 
 CREATE TABLE IF NOT EXISTS watermark (
     venue_id   VARCHAR PRIMARY KEY,
     last_date  DATE NOT NULL,
-    updated_at TIMESTAMP NOT NULL  -- UTC
+    updated_at TIMESTAMP NOT NULL,  -- UTC
+    article    VARCHAR              -- the title the coverage up to last_date is for
 );
 
 CREATE TABLE IF NOT EXISTS run_log (
@@ -95,24 +122,36 @@ CREATE TABLE IF NOT EXISTS run_log (
     finished_at       TIMESTAMP,  -- UTC
     status            VARCHAR NOT NULL,
     venues            INTEGER NOT NULL,
-    requests          INTEGER NOT NULL,
+    requests          INTEGER NOT NULL,  -- windows asked for
     rows_fetched      INTEGER NOT NULL,
     rows_loaded       INTEGER NOT NULL,
     rows_quarantined  INTEGER NOT NULL,
     reject_rate       DOUBLE,
-    note              VARCHAR
+    note              VARCHAR,
+    http_requests     INTEGER            -- NULL when the fetcher was injected
 );
 """
 
 # `CREATE TABLE IF NOT EXISTS` does nothing to a table that already exists, so a
-# warehouse built by an earlier version keeps the old shape and the next insert
-# fails on the column count. Adding the column is idempotent, and every insert in
-# this module names its columns, so it does not matter that a migrated column
-# lands at the end rather than in the middle where the DDL above puts it.
-MIGRATIONS = """
+# warehouse built by an earlier version keeps the old shape. Adding a column is
+# idempotent, and every insert here names its columns, so a migrated column
+# landing at the end rather than where the DDL above puts it does not matter.
+#
+# The UPDATE moves free-text annotations out of `resolution`, where earlier
+# versions kept them, into `note`: `resolution` now holds only decisions the
+# code acts on. Those annotations never released anything, so the rows reopen.
+MIGRATIONS = f"""
 ALTER TABLE quarantine ADD COLUMN IF NOT EXISTS view_date DATE;
 ALTER TABLE quarantine ADD COLUMN IF NOT EXISTS resolved_at TIMESTAMP;
 ALTER TABLE quarantine ADD COLUMN IF NOT EXISTS resolution VARCHAR;
+ALTER TABLE quarantine ADD COLUMN IF NOT EXISTS window_start DATE;
+ALTER TABLE quarantine ADD COLUMN IF NOT EXISTS window_end DATE;
+ALTER TABLE quarantine ADD COLUMN IF NOT EXISTS note VARCHAR;
+ALTER TABLE watermark ADD COLUMN IF NOT EXISTS article VARCHAR;
+ALTER TABLE run_log ADD COLUMN IF NOT EXISTS http_requests INTEGER;
+UPDATE quarantine
+SET note = coalesce(note, resolution), resolution = NULL, resolved_at = NULL
+WHERE resolution IS NOT NULL AND resolution NOT IN ('{ACCEPTED}', '{SUPERSEDED}');
 """
 
 
@@ -124,12 +163,25 @@ class Venue:
     wiki_article: str
 
 
+@dataclass(frozen=True)
+class Plan:
+    venue: Venue
+    start: date
+    gave_up_days: int = 0
+
+
 @dataclass
 class Fetched:
     venue: Venue
     start: date
     clean: list[quality.CleanRow]
     bad: list[quality.BadRow]
+
+
+@dataclass
+class FetchOutcome:
+    fetched: list[Fetched] = field(default_factory=list)
+    failures: dict[str, str] = field(default_factory=dict)  # venue_id -> note
 
 
 @dataclass
@@ -143,28 +195,15 @@ class RunSummary:
     rows_quarantined: int = 0
     reject_rate: float = 0.0
     note: str = ""
+    http_requests: int | None = None
 
 
 def utc_now() -> datetime:
     """Now, in UTC, with no offset attached - which is what the columns hold.
 
-    DuckDB's TIMESTAMP is timezone-NAIVE. Handing it an aware datetime does not
-    store the offset and does not store UTC: it converts the instant to the
-    SESSION's local wall time and keeps that. So `datetime.now(UTC)` - which
-    every write site used, deliberately - was the one value in the schema
-    guaranteed to be stored in local time, beside a view_date that genuinely is
-    a UTC day. On an NZST host a row loaded at 09:53 UTC read back as 21:53,
-    twelve hours ahead of every date in its own table; the same file read in
-    another zone reported different absolute times for the same run; and in a
-    DST zone the local clock steps back once a year, so `ORDER BY started_at
-    DESC` - the query the README recommends - could order two runs an hour
-    apart backwards.
-
-    Dropping the offset AFTER converting to UTC stores the UTC wall time, which
-    is what the column is documented to hold and what the rest of the schema
-    already assumes. TIMESTAMPTZ would carry the offset properly, but DuckDB
-    needs pytz to read one back, and a timezone bug is not worth a new runtime
-    dependency.
+    DuckDB's TIMESTAMP is timezone-naive, and given an aware datetime it stores
+    the session's LOCAL wall time. Dropping the offset after converting to UTC
+    stores UTC. TIMESTAMPTZ would need pytz to read back.
     """
     return datetime.now(UTC).replace(tzinfo=None)
 
@@ -182,12 +221,10 @@ VENUE_COLUMNS = ("venue_id", "venue_name", "region", "wiki_article")
 def read_venues(path: str | Path) -> list[Venue]:
     """Parse venues.csv, complaining with a line number when it cannot.
 
-    This file is hand-edited, often in a spreadsheet, so it is the most likely
-    thing in the project to be wrong. `Venue(**row)` turned every mistake into
-    the same unhelpful TypeError from the dataclass constructor, naming a keyword
-    rather than a line. utf-8-sig rather than utf-8 because Excel writes a BOM,
-    which would otherwise ride along inside the first column name and make
-    `venue_id` mysteriously missing.
+    The file is hand-edited, often in a spreadsheet. utf-8-sig because Excel
+    writes a BOM, which would otherwise ride along inside `venue_id`. A line
+    that is blank in all four columns - what a spreadsheet leaves at the end -
+    is skipped.
     """
     with open(path, newline="", encoding="utf-8-sig") as handle:
         reader = csv.DictReader(handle)
@@ -195,12 +232,9 @@ def read_venues(path: str | Path) -> list[Venue]:
         missing = [column for column in VENUE_COLUMNS if column not in header]
         if missing:
             raise ValueError(f"{path}: missing column(s) {missing}; found {header}")
-        # csv.DictReader keeps the *last* value for a repeated column name, so a
-        # duplicated header silently discards the real value - or, for a repeated
-        # `venue_id`, files every row under the wrong venue. Only the columns we
-        # actually read matter: a spreadsheet export ends lines with stray commas,
-        # which DictReader names `''` twice over, and two notes columns of
-        # someone else's are still none of our business.
+        # DictReader keeps the LAST value for a repeated column name, so a
+        # duplicated `venue_id` would file every row under the wrong venue.
+        # Only the columns we read matter: trailing commas make `''` columns.
         repeated = sorted({column for column in VENUE_COLUMNS if header.count(column) > 1})
         if repeated:
             raise ValueError(f"{path}: repeated column(s) {repeated} in header {header}")
@@ -209,17 +243,21 @@ def read_venues(path: str | Path) -> list[Venue]:
         seen: dict[str, int] = {}
         for line, row in enumerate(reader, start=2):
             fields = {column: (row.get(column) or "").strip() for column in VENUE_COLUMNS}
-            # NFC on the title only, so a macron typed as `u` + combining macron
-            # matches the API's single codepoint (see `quality.normalise_title`).
-            # Deliberately not on `venue_id`: it is the key every stored row is
-            # written under, so re-spelling it would orphan an existing
-            # warehouse's watermark and duplicate its history under a second id
-            # that looks identical on screen. It buys nothing there either - the
-            # id is ours, and never compared with anything the API sends.
+            if not any(fields.values()):
+                continue
+            # The title is normalised to MediaWiki's canonical spelling; the id
+            # is not. It is the key every stored row is written under, and is
+            # never compared with anything the API sends.
             fields["wiki_article"] = quality.normalise_title(fields["wiki_article"])
             blank = [column for column, value in fields.items() if not value]
             if blank:
                 raise ValueError(f"{path} line {line}: empty {blank}")
+            bad_chars = quality.invalid_title_chars(fields["wiki_article"])
+            if bad_chars:
+                raise ValueError(
+                    f"{path} line {line}: wiki_article {fields['wiki_article']!r} contains "
+                    f"{''.join(bad_chars)!r}, which no Wikipedia title can"
+                )
 
             venue_id = fields["venue_id"]
             if venue_id in seen:
@@ -228,8 +266,6 @@ def read_venues(path: str | Path) -> list[Venue]:
                     f"already used on line {seen[venue_id]}"
                 )
             seen[venue_id] = line
-            # Only the four columns we know about, so an extra one someone added
-            # for their own notes is tolerated rather than fatal.
             venues.append(Venue(**fields))
 
     if not venues:
@@ -251,28 +287,36 @@ def plan_windows(start: date, end: date, chunk_days: int) -> list[tuple[date, da
 
 
 def get_watermark(con, venue_id: str) -> date | None:
-    row = con.execute("SELECT last_date FROM watermark WHERE venue_id = ?", [venue_id]).fetchone()
+    row = _watermark_row(con, venue_id)
     return row[0] if row else None
 
 
+def _watermark_row(con, venue_id: str) -> tuple[date, str | None] | None:
+    return con.execute(
+        "SELECT last_date, article FROM watermark WHERE venue_id = ?", [venue_id]
+    ).fetchone()
+
+
 def start_date_for(con, venue: Venue, end: date, backfill_days: int) -> date:
-    """Resume the day after the watermark, or backfill on first sight of a venue."""
-    watermark = get_watermark(con, venue.venue_id)
+    """Resume the day after the watermark, or backfill on first sight of a venue.
+
+    Two watermarks are not a record of coverage for this venue, and the whole
+    backfill window is asked for again:
+
+    - One for a venue that has never produced a row. The frontier is a property
+      of the API, so healthy siblings walk a dead venue's watermark along the
+      trust line; a typo corrected in venues.csv would otherwise recover only
+      the days since.
+    - One recorded for a different title. Coverage of a redirect says nothing
+      about the canonical article that replaced it.
+    """
+    row = _watermark_row(con, venue.venue_id)
     backfill = end - timedelta(days=backfill_days - 1)
-    if watermark is None:
+    if row is None:
         return backfill
-    if not _has_any_rows(con, venue.venue_id):
-        # A watermark that has only ever walked on the trust line, for a venue
-        # that has never produced a row, is not a record of coverage - it is
-        # the OTHER venues' evidence wearing this venue's name. The frontier is
-        # a property of the API, so a healthy sibling pushes this venue's
-        # watermark forward night after night while its own article 404s.
-        #
-        # A typo in venues.csv therefore consumed the whole backfill window on
-        # the first run, and read_venues keeps venue_id stable when the title
-        # is corrected, so fixing the typo recovered only the days since. Keep
-        # asking for the whole window until the venue produces something; the
-        # moment it does, this stops.
+    watermark, article = row
+    retitled = article is not None and article != venue.wiki_article
+    if retitled or not _has_any_rows(con, venue.venue_id):
         return min(watermark + timedelta(days=1), backfill)
     return watermark + timedelta(days=1)
 
@@ -284,177 +328,184 @@ def _venue_watermark(
     venue_bad: list[quality.BadRow],
     trusted_end: date | None,
     accepted: set[date] | None = None,
+    accepted_null: set[tuple[str, date | None]] | None = None,
 ) -> date | None:
     """How far this venue may advance. None means leave the watermark alone.
 
     The watermark promises that every day up to it has been dealt with, so it may
-    not step over a day we failed to load. Two kinds of day fail that test, and
-    they need opposite treatment.
+    not step over a day we failed to load.
 
-    A quarantined day is a hard stop, whatever its age. The row is in
-    `quarantine`, but the gate is a rate across every venue, so one venue's bad
-    patch can sit under the threshold and pass; advancing anyway would turn the
-    quarantine into a record of data we permanently lost. The watermark therefore
-    stops the day before the earliest rejected one.
-
-    An *absent* day is the ambiguous one, because the API omits days with no
-    traffic instead of sending a zero. Absent means "quiet" or "not published
-    yet" and nothing in the response distinguishes them. Two things do:
-
-    - Anything before a day that did arrive is settled. Publication runs in date
-      order, so a later day arriving proves the earlier one was published, and
-      absence there can only mean quiet. Hence the watermark may always advance
-      to the last day actually loaded, holes behind it included.
-    - Past that, only age helps. An absent day older than `trusted_end` is taken
-      as quiet; a more recent one is left alone and asked for again next run,
-      which is what stops a long publication lag becoming a permanent hole.
-
-    `trusted_end` is None when nothing anywhere proves the upstream has
-    published anything - see run(). Age is then no evidence at all, so an
-    absent day cannot be called quiet and the watermark advances only as far as
-    a day that actually arrived.
+    - A rejected day inside the requested range is a hard stop, whatever its
+      age, unless an operator has accepted it. A rejected day outside the range
+      is recorded but does not stop anything: the watermark passed it runs ago.
+    - A rejected row with no parseable day stops the watermark before the
+      window it arrived in, since any day of that window could be the one it
+      was for - unless an operator has accepted that rule for that window.
+    - An absent day before one that arrived is settled: publication runs in date
+      order. (`client.fetch_window` has already re-asked such holes narrowly.)
+    - An absent day after the last one that arrived is settled only once it is
+      older than `trusted_end`. With no evidence anywhere that the upstream
+      has published (`trusted_end` is None), nothing is settled: in that case
+      no venue loaded anything either, so the watermark stays where it is.
     """
-    if any(row.view_date is None for row in venue_bad):
-        # A row rejected by `timestamp_parses` cannot be pinned to a day, so we
-        # cannot know which day to stop before. Advancing past an unknown day is
-        # the one thing we must not do.
-        return None
-
-    # Only a bad day *inside* the window is a day this run promised anything
-    # about. A stray date outside it is still recorded in `quarantine`, but the
-    # watermark passed that day runs ago; stopping for it permanently neither
-    # recovers the day nor stops recurring, and would leave the venue re-fetching
-    # its whole range every night until it hit the lookback cap.
-    # A day the operator has accepted is not a day this run failed to deal
-    # with; it is a day dealt with by deciding it is never coming. Without this
-    # the hold is a dead end: the venue rejects the same day for ever and the
-    # watermark can never step over it, which is why `resolve --accept` exists.
     accepted = accepted or set()
-    in_window = [
-        row.view_date
-        for row in venue_bad
-        if start <= row.view_date <= end and row.view_date not in accepted
-    ]
-    ceiling = min(in_window) - timedelta(days=1) if in_window else end
+    accepted_null = accepted_null or set()
+    stops = []
+    for row in venue_bad:
+        if row.view_date is None:
+            if (row.rule, row.window_start) not in accepted_null:
+                stops.append(row.window_start or start)
+        elif start <= row.view_date <= end and row.view_date not in accepted:
+            stops.append(row.view_date)
+    ceiling = min(stops) - timedelta(days=1) if stops else end
 
-    loaded = [row.view_date for row in venue_clean]
     if trusted_end is None:
-        # No evidence the upstream has published anything. Advance only to a
-        # day that actually arrived, and not at all if none did.
-        if not loaded:
-            return None
-        frontier = max(loaded)
-    else:
-        trusted = min(end, trusted_end)
-        frontier = max(max(loaded), trusted) if loaded else trusted
-
+        return None
+    loaded = [row.view_date for row in venue_clean]
+    trusted = min(end, trusted_end)
+    frontier = max(max(loaded), trusted) if loaded else trusted
     frontier = min(frontier, ceiling)
     return frontier if frontier >= start else None
 
 
-def _validate_params(
+def validate_params(
     chunk_days: int,
     backfill_days: int,
     max_reject_rate: float,
     max_lookback_days: int,
     trust_lag_days: int,
+    max_http_requests: int | None = DEFAULT_MAX_HTTP_REQUESTS,
 ) -> None:
-    # Validated rather than trusted, because the failure modes are silent. A
-    # max_reject_rate of nan disables the gate outright - every comparison
-    # against nan is False, so no rate is ever "too high" and a run that
-    # rejected everything still reports ok. A backfill_days of 0 asks for an
-    # empty range and looks like a venue with no traffic.
+    """Refuse parameters whose failure would be silent.
+
+    A max_reject_rate of nan disables the hold outright, since every comparison
+    against nan is False. A backfill_days of 0 asks for an empty range and looks
+    like a quiet venue. A backfill longer than the lookback cap would be cut to
+    the cap and the difference reported as "gave up".
+    """
     for name, value in (
         ("chunk_days", chunk_days),
         ("backfill_days", backfill_days),
         ("max_lookback_days", max_lookback_days),
         ("trust_lag_days", trust_lag_days),
     ):
-        if not isinstance(value, int) or isinstance(value, bool) or value < 1:
-            raise ValueError(f"{name} must be an integer >= 1, got {value!r}")
+        if not isinstance(value, int) or isinstance(value, bool) or not 1 <= value <= MAX_DAYS:
+            raise ValueError(f"{name} must be an integer in 1..{MAX_DAYS}, got {value!r}")
+    if backfill_days > max_lookback_days:
+        raise ValueError(
+            f"backfill_days {backfill_days} is more than max_lookback_days "
+            f"{max_lookback_days}; raise the lookback or ask for fewer days"
+        )
+    if max_http_requests is not None and (
+        not isinstance(max_http_requests, int)
+        or isinstance(max_http_requests, bool)
+        or max_http_requests < 1
+    ):
+        raise ValueError(f"max_http_requests must be an integer >= 1, got {max_http_requests!r}")
     if not isinstance(max_reject_rate, (int, float)) or isinstance(max_reject_rate, bool):
         raise ValueError(f"max_reject_rate must be a number, got {max_reject_rate!r}")
-    # Range first, isfinite second. math.isfinite converts its argument to a
-    # float, so 10**1000 raised OverflowError out of the validator that exists
-    # to give a clean rejection. The range test handles an int of any size, and
-    # nan fails it too, since every comparison against nan is False.
+    # Range first: math.isfinite converts to float, and 10**1000 overflows.
+    # nan fails the range test too.
     if not 0.0 <= max_reject_rate <= 1.0 or (
         isinstance(max_reject_rate, float) and not math.isfinite(max_reject_rate)
     ):
         raise ValueError(
             f"max_reject_rate must be a finite fraction in [0, 1], got {max_reject_rate!r}. "
-            f"nan in particular disables the gate silently: every comparison against it "
-            f"is False, so no run is ever rejected."
+            f"nan in particular disables the hold silently: every comparison against it "
+            f"is False, so no venue is ever held."
         )
 
 
-def _fetch_all(
-    con,
-    venues: list[Venue],
+def decide_status(
     *,
-    end: date,
-    floor: date,
-    chunk_days: int,
-    backfill_days: int,
-    today: date,
-    fetch,
-    summary: RunSummary,
-    clean: list[quality.CleanRow],
-    bad: list[quality.BadRow],
-    stalled: list[str],
-) -> tuple[list[Fetched], list[str]]:
-    fetched: list[Fetched] = []
-    failures: list[str] = []
+    held: set[str],
+    blocked: set[str],
+    failed: set[str],
+    gave_up: set[str],
+    never_produced: set[str],
+) -> tuple[str, list[str]]:
+    """`ok` means the warehouse is complete for every venue; anything else is `degraded`.
+
+    Returns the status and the venues that stop it being `ok`.
+    """
+    unresolved = sorted(held | blocked | failed | gave_up | never_produced)
+    return ("degraded" if unresolved else "ok"), unresolved
+
+
+def _plan(con, venues: list[Venue], *, end: date, floor: date, backfill_days: int) -> list[Plan]:
+    plans = []
     for venue in venues:
         start = start_date_for(con, venue, end, backfill_days)
+        gave_up = 0
         if start < floor:
             # Stuck on a bad day for longer than we are willing to re-ask.
-            # Give up on the span below the floor, but say so out loud.
-            stalled.append(f"{venue.venue_id}: gave up on {(floor - start).days} days")
+            gave_up = (floor - start).days
             start = floor
-        if start > end:
-            continue  # already current, nothing to ask for
+        if start <= end:
+            plans.append(Plan(venue, start, gave_up))
+    return plans
 
+
+def _fetch_all(
+    plans: list[Plan],
+    *,
+    end: date,
+    chunk_days: int,
+    fetch,
+    summary: RunSummary,
+) -> FetchOutcome:
+    """Fetch and check every planned venue. Touches no database."""
+    outcome = FetchOutcome()
+    transport_failures = 0
+    tripped: str | None = None
+
+    for plan in plans:
+        venue = plan.venue
+        if tripped:
+            outcome.failures[venue.venue_id] = (
+                f"{venue.venue_id}: not attempted, {tripped}; watermark held"
+            )
+            continue
+
+        windows = plan_windows(plan.start, end, chunk_days)
+        log.info(
+            "%s: asking for %s..%s in %d window(s)", venue.venue_id, plan.start, end, len(windows)
+        )
         venue_clean: list[quality.CleanRow] = []
         venue_bad: list[quality.BadRow] = []
-
+        fetched_rows = 0
         try:
-            for window_start, window_end in plan_windows(start, end, chunk_days):
-                # Counted BEFORE the call. The failure path writes this summary
-                # to the run log, and incrementing afterwards meant the request
-                # that raised was never counted - so the one run whose request
-                # count matters read one short, and a venue that failed on its
-                # first window logged `requests 0` while having gone to the
-                # network. The field answers "how many windows did we ask for",
-                # which is decided when we ask, not when we get an answer.
+            for window_start, window_end in windows:
+                # Counted before the call, so a window whose request raises is
+                # still counted: the field is "windows asked for".
                 summary.requests += 1
                 items = fetch(venue.wiki_article, window_start, window_end)
-                summary.rows_fetched += len(items)
-
+                fetched_rows += len(items)
                 good, rejected = quality.check_window(
                     items,
                     venue_id=venue.venue_id,
                     article=venue.wiki_article,
                     start=window_start,
                     end=window_end,
-                    today=today,
                 )
                 venue_clean.extend(good)
                 venue_bad.extend(rejected)
-
         except client.ApiError as exc:
-            note = f"{venue.venue_id}: {exc}; watermark held"
-            failures.append(note)
-            stalled.append(note)
+            # The venue's earlier windows from this run are discarded with it.
+            log.warning("%s: %s; watermark held", venue.venue_id, exc)
+            outcome.failures[venue.venue_id] = f"{venue.venue_id}: {exc}; watermark held"
+            if isinstance(exc, client.RequestBudgetExceeded):
+                tripped = "the request budget is spent"
+            elif isinstance(exc, client.TransportError) and not outcome.fetched:
+                transport_failures += 1
+                if transport_failures >= TRANSPORT_BREAKER:
+                    tripped = f"the network looks unreachable ({transport_failures} venues failed)"
             continue
 
-        clean.extend(venue_clean)
-        bad.extend(venue_bad)
-        fetched.append(Fetched(venue, start, venue_clean, venue_bad))
+        summary.rows_fetched += fetched_rows
+        outcome.fetched.append(Fetched(venue, plan.start, venue_clean, venue_bad))
 
-    if failures and not fetched:
-        raise client.ApiError("All requested venues failed: " + "; ".join(failures))
-    return fetched, stalled
+    return outcome
 
 
 def _advance_watermarks(
@@ -464,84 +515,86 @@ def _advance_watermarks(
     end: date,
     trusted_end: date | None,
     trust_lag_days: int,
-    silent: list[str],
-) -> tuple[dict[str, date], list[str]]:
+) -> tuple[dict[str, date], set[str], list[str]]:
+    """New watermarks, the venues that have never produced a row, and notes."""
     new_watermarks: dict[str, date] = {}
+    never_produced: set[str] = set()
+    notes: list[str] = []
     for f in fetched:
-        venue, start, venue_clean, venue_bad = f.venue, f.start, f.clean, f.bad
+        venue = f.venue
         frontier = _venue_watermark(
-            start,
+            f.start,
             end,
-            venue_clean,
-            venue_bad,
+            f.clean,
+            f.bad,
             trusted_end,
             accepted=accepted_days(con, venue.venue_id),
+            accepted_null=accepted_null_windows(con, venue.venue_id),
         )
-        # Never move a watermark backwards. A venue already current past the
-        # trust line would otherwise be dragged back to it and re-fetch the
-        # same days every night.
-        current = get_watermark(con, venue.venue_id)
-        if frontier is not None and (current is None or frontier > current):
+        current, stored_article = _watermark_row(con, venue.venue_id) or (None, None)
+        retitled = stored_article is not None and stored_article != venue.wiki_article
+        if retitled:
+            notes.append(
+                f"{venue.venue_id}: title changed from {stored_article!r} to "
+                f"{venue.wiki_article!r}, re-fetched from {f.start}; rows before that "
+                f"are still for the old title"
+            )
+        # Never backwards - except when the coverage it records is for another
+        # title, in which case it is not coverage of this one at all.
+        if frontier is not None and (current is None or retitled or frontier > current):
             new_watermarks[venue.venue_id] = frontier
+        elif current is not None and stored_article is None:
+            new_watermarks[venue.venue_id] = current  # record which title it is for
 
-        # Two shapes worth naming, both of which look like `ok` otherwise.
-        #
-        # A venue that asked for its whole range and has never produced a row
-        # is what a typo in `venues.csv` makes: the article does not exist,
-        # every width and slice 404s, the window verifies as genuinely empty,
-        # and the run retires the backfill. A venue that is simply quiet has
-        # the same shape, and deserves the same second look.
-        #
-        # A venue whose watermark is falling further behind `end` every night
-        # is stuck - on a day it cannot load, or on a frontier that is not
-        # moving. Holding is the intended behaviour, since it re-requests
-        # rather than losing the days, but it should not be something you have
-        # to notice for yourself. A healthy venue sits within a day or two of
-        # `end`, so the trust lag is a generous threshold.
-        #
-        # The two conditions used to meet in the middle and leave a gap.
-        # The first required venue_bad to be EMPTY, so a venue that was
-        # returning rows and having all of them rejected was excluded from
-        # "no rows ever"; the second reads `effective`, which is None for a
-        # venue that has never set a watermark, so it was excluded there
-        # too. A venue whose article title resolves to a DIFFERENT article
-        # - the realistic hazard, since the API is title-exact and
-        # redirects are silent - lands exactly there: every row fails
-        # article_matches_request and the note was empty, so the only
-        # signal was the gate - which does not report a venue, it stops the
-        # pipeline. (An earlier version of this comment claimed the healthy
-        # venues "dilute the reject rate below the gate". They do not:
-        # one venue of eight is 12.5% against a 5% ceiling.) The test is
-        # now "has this venue ever loaded a row", which is the question the
-        # alert was always asking.
-        effective = new_watermarks.get(venue.venue_id, current)
-        if not _has_any_rows(con, venue.venue_id) and not venue_clean:
-            detail = f", {len(venue_bad)} row(s) rejected" if venue_bad else ""
-            silent.append(f"{venue.venue_id}: no rows ever{detail}, check {venue.wiki_article!r}")
-        else:
-            # Measured from the last day this venue actually PRODUCED, not
-            # from its watermark. The watermark walks the trust line on
-            # other venues' evidence whether or not this article is still
-            # being served, so it sits at exactly
-            # `trust_lag_days - PUBLICATION_LAG_DAYS` behind `end` and can
-            # never satisfy `> trust_lag_days`. An article renamed or
-            # deleted upstream was therefore skipped day after day by a
-            # watermark that was, in this scenario, the thing telling the
-            # lie - and the alert built to catch it could not fire.
-            last = con.execute(
-                "SELECT max(view_date) FROM pageviews WHERE venue_id = ?",
-                [venue.venue_id],
-            ).fetchone()[0]
-            if venue_clean:
-                newest = max(r.view_date for r in venue_clean)
-                last = newest if last is None else max(last, newest)
-            if last is not None and (end - last).days > trust_lag_days:
-                silent.append(
-                    f"{venue.venue_id}: no rows for {(end - last).days} days "
-                    f"(watermark {effective}), check {venue.wiki_article!r}"
-                )
+        has_history = _has_any_rows(con, venue.venue_id) and not retitled
+        if not has_history and not f.clean:
+            # A typo in venues.csv, an article that 404s everywhere, or a title
+            # that resolves to a different article so every row is rejected.
+            never_produced.add(venue.venue_id)
+            detail = f", {len(f.bad)} row(s) rejected" if f.bad else ""
+            notes.append(f"{venue.venue_id}: no rows ever{detail}, check {venue.wiki_article!r}")
+            continue
 
-    return new_watermarks, silent
+        # Measured from the last day this venue actually produced, not from its
+        # watermark, which walks the trust line on other venues' evidence and
+        # so can never fall more than trust_lag_days behind.
+        last = con.execute(
+            "SELECT max(view_date) FROM pageviews WHERE venue_id = ?", [venue.venue_id]
+        ).fetchone()[0]
+        if f.clean:
+            newest = max(r.view_date for r in f.clean)
+            last = newest if last is None else max(last, newest)
+        if last is not None and (end - last).days > trust_lag_days:
+            effective = new_watermarks.get(venue.venue_id, current)
+            notes.append(
+                f"{venue.venue_id}: no rows for {(end - last).days} days "
+                f"(watermark {effective}), check {venue.wiki_article!r}"
+            )
+
+    return new_watermarks, never_produced, notes
+
+
+def _reject_key(venue_id, view_date, rule, window_start) -> tuple:
+    """The identity of a rejection: one per venue, day and rule.
+
+    A row with no day is identified by the window it arrived in instead, so an
+    accepted one is recognised when the same window is asked for again, and a
+    new one in a later window is not mistaken for it.
+    """
+    return (venue_id, view_date, rule, window_start if view_date is None else None)
+
+
+_KEY_COLUMNS = "venue_id, view_date, rule, CASE WHEN view_date IS NULL THEN window_start END"
+_KEY_MATCH = (
+    "venue_id = ? AND view_date IS NOT DISTINCT FROM ? AND rule = ? "
+    "AND (view_date IS NOT NULL OR window_start IS NOT DISTINCT FROM ?)"
+)
+
+
+def _is_accepted(row: quality.BadRow, days: set[date], null_windows: set) -> bool:
+    if row.view_date is None:
+        return (row.rule, row.window_start) in null_windows
+    return row.view_date in days
 
 
 def _apply_gate(
@@ -549,293 +602,54 @@ def _apply_gate(
     fetched: list[Fetched],
     bad: list[quality.BadRow],
     max_reject_rate: float,
-    silent: list[str],
-) -> set[str]:
-    # The gate fires on what is NEW.
-    #
-    # A day already sitting in `quarantine` for the same rule cannot be
-    # lost a second time - _venue_watermark is already holding the
-    # watermark short of it, which is the whole mechanism by which nothing
-    # is lost. Counting it again every night turns one broken venue into a
-    # permanent stoppage of the entire pipeline, and the rate it pins is
-    # scale-invariant: one venue of eight rejecting everything gives
-    # 1/8 = 12.5% however long the range or however many venues there are.
-    # Growth does not dilute it; adding venues does not dilute it.
-    #
-    # Measured, with one venue whose title had drifted so the API answered
-    # 200 with a different article:
-    #
-    #   night 0: GATE TRIPPED rate=0.125
-    #   night 1: GATE TRIPPED rate=0.125
-    #   ... every night, indefinitely
-    #   rows stored for the SEVEN HEALTHY venues : 0
-    #
-    # Nothing loads, so no watermark moves, so every venue re-fetches the
-    # same window forever - and once the oldest held day falls past
-    # max_lookback_days, all eight venues give up on it together. A single
-    # silent redirect upstream costs the whole warehouse.
-    #
-    # The gate exists to stop a bad EXTRACT reaching the warehouse. A day
-    # that has already been quarantined is not part of this extract's
-    # verdict; it is a standing problem, and `run_log.note` is what reports
-    # a standing problem.
-    already = {
-        (r[0], r[1], r[2])
-        for r in con.execute("SELECT venue_id, view_date, rule FROM quarantine").fetchall()
-    }
-    novel = [r for r in bad if (r.venue_id, r.view_date, r.rule) not in already]
+) -> tuple[set[str], list[str]]:
+    """Hold each venue whose NEWLY rejected share is over the ceiling.
 
+    A held venue loads nothing and its watermark stays put; its rejected rows
+    still reach `quarantine`. The other venues load.
+
+    New, not raw: once a watermark stops before a permanently bad day, the next
+    window starts at that day and is 1 of 1 rejected, which would hold the venue
+    for ever for a fault costing one day. A standing rejection is the
+    watermark's job and the status's to report. So the hold lifts on the next
+    run, once the rejections are on record; the watermark still does not pass
+    the bad days until they load cleanly or are accepted.
+    """
+    notes: list[str] = []
+    already = set(con.execute(f"SELECT {_KEY_COLUMNS} FROM quarantine").fetchall())
+    novel = [
+        r
+        for r in bad
+        if _reject_key(r.venue_id, r.view_date, r.rule, r.window_start) not in already
+    ]
     if len(novel) != len(bad):
-        # Otherwise the log shows a rate above the ceiling and nothing says
-        # how much of it is a standing problem rather than tonight's. The gate
-        # itself counts raw rejections, so this is reporting, not arithmetic.
-        silent.append(
+        notes.append(
             f"{len(bad) - len(novel)} of {len(bad)} rejected rows were already quarantined"
         )
 
-    # ... and it fires per VENUE before it fires globally.
-    #
-    # Novel-only is necessary but not sufficient on its own: `quarantine`
-    # is written by _load, which runs AFTER this, so a venue that breaks
-    # all at once persists nothing, `already` stays empty, and every night
-    # looks like the first. A venue whose NOVEL rejection rate is over the
-    # ceiling is broken on its own terms and does not get a vote in "is
-    # tonight's extract broadly bad". Its rows are still quarantined, its
-    # watermark is still held short of them by _venue_watermark, and it is
-    # named in the note. What changes is that it can no longer stop the
-    # other seven venues from loading.
-    #
-    # Novel, not raw, for the per-venue test too. A venue stuck re-fetching
-    # one known-bad day is 100% rejected every night on a window of one -
-    # so a raw test would hold it forever, and if every venue is stuck on
-    # its own bad day it would hold all of them and deadlock exactly as
-    # before. Nothing is NEWLY wrong with such a venue; the standing
-    # problem is what run_log.note reports.
-    # Novel rejections decide the HOLD; outstanding ones decide the STATUS.
-    #
-    # Holding on raw rejections looks stricter and is wrong for the commonest
-    # shape. Once the watermark stops before a permanently bad day, the next
-    # window starts at that day, so it is 1 of 1 rejected -- 100%, held for
-    # ever, and its clean days stop loading too. A single bad day must be
-    # blocked by the watermark, not by the gate.
-    #
-    # Novel-only was blamed for the run going green while venues were still
-    # broken. It was not the cause. The whole-run abort was: it raised before
-    # _load, so `quarantine` stayed empty, every night looked like the first,
-    # and the healthy venues were refused with the broken ones. Measured, five
-    # of eight drifting: nights 1-19 loaded nothing at all, then `ok` from night
-    # 20 once quarantine finally filled.
-    #
-    # With the abort gone, novel does the job it was meant to do, and the "went
-    # green" half is fixed where it belongs -- in the status, which now reports
-    # any venue still carrying an unresolved rejection.
-
     held = set()
     for f in fetched:
-        venue, venue_clean, venue_bad = f.venue, f.clean, f.bad
-        accepted = accepted_days(con, venue.venue_id)
-        seen = len(venue_clean) + len(venue_bad)
+        venue_id = f.venue.venue_id
+        days, null_windows = accepted_days(con, venue_id), accepted_null_windows(con, venue_id)
+        seen = len(f.clean) + len(f.bad)
         fresh = sum(
-            1 for r in novel if r.venue_id == venue.venue_id and r.view_date not in accepted
+            1 for r in novel if r.venue_id == venue_id and not _is_accepted(r, days, null_windows)
         )
         if seen and quality.reject_rate(seen, fresh) > max_reject_rate:
-            held.add(venue.venue_id)
-            silent.append(
-                f"{venue.venue_id}: {fresh}/{seen} newly rejected, above the ceiling, held"
-            )
-    # Holding a venue has to mean holding it. Excluding it from the gate
-    # while still loading its rows was the worst of both: the whole-run
-    # gate could no longer refuse the extract, and `INSERT OR REPLACE`
-    # wrote the venue's surviving rows straight over days the warehouse
-    # already held from a good run. Measured with a venue 10/30 rejected:
-    # 20 clean rows went into the warehouse under a note saying "held".
-    #
-    # Its clean rows are dropped and its watermark stays put, so every day
-    # it covered is asked for again next run.
-    #
-    # `bad` is deliberately untouched: the venue's rejected rows still reach
-    # `quarantine`, which is what an operator reads before deciding. A venue
-    # that stays broken stays held -- there is no self-heal any more, and that
-    # is the point: `resolve --accept` is the way out, and it is a decision
-    # somebody makes rather than one the code makes by forgetting.
-    return held
-
-
-def run(
-    con,
-    venues: list[Venue],
-    *,
-    today: date | None = None,
-    chunk_days: int = DEFAULT_CHUNK_DAYS,
-    backfill_days: int = DEFAULT_BACKFILL_DAYS,
-    max_reject_rate: float = DEFAULT_MAX_REJECT_RATE,
-    max_lookback_days: int = DEFAULT_MAX_LOOKBACK_DAYS,
-    trust_lag_days: int = TRUST_LAG_DAYS,
-    fetch=client.fetch_window,
-) -> RunSummary:
-    _validate_params(chunk_days, backfill_days, max_reject_rate, max_lookback_days, trust_lag_days)
-    today = today or datetime.now(UTC).date()
-    end = today - timedelta(days=PUBLICATION_LAG_DAYS)
-    floor = end - timedelta(days=max_lookback_days - 1)
-    calendar_trust_line = today - timedelta(days=trust_lag_days)
-
-    run_id = uuid.uuid4().hex[:12]
-    started_at = utc_now()
-    summary = RunSummary(run_id=run_id, status="running", venues=len(venues))
-
-    clean: list[quality.CleanRow] = []
-    bad: list[quality.BadRow] = []
-    new_watermarks: dict[str, date] = {}
-    stalled: list[str] = []
-    silent: list[str] = []
-    fetched: list[Fetched] = []
-
-    try:
-        fetched, stalled = _fetch_all(
-            con,
-            venues,
-            end=end,
-            floor=floor,
-            chunk_days=chunk_days,
-            backfill_days=backfill_days,
-            today=today,
-            fetch=fetch,
-            summary=summary,
-            clean=clean,
-            bad=bad,
-            stalled=stalled,
-        )
-
-        # How far the upstream has demonstrably published. Publication is a
-        # property of the API, not of one article, so the newest day seen for any
-        # venue - this run or in any run before it - is evidence for all of them.
-        #
-        # The calendar trust line alone was a fixed bet that the lag never runs
-        # longer than `trust_lag_days`. Once an absent day drifted past that line
-        # the watermark stepped over it whether or not anything had ever been
-        # published for that day, so a stall longer than
-        # `trust_lag_days - PUBLICATION_LAG_DAYS` lost days permanently, silently,
-        # with the run still reporting `ok`. Bounding the line by what has
-        # actually been seen makes a stall cost a re-request instead.
-        #
-        # With no evidence anywhere - an empty warehouse and a run that
-        # fetched nothing - the calendar line used to stand, on the reasoning
-        # that a set of genuinely quiet venues should still make progress. That
-        # is the same bet the frontier bound above exists to refuse, and it is
-        # open exactly when the warehouse is empty, which an outage keeps true
-        # indefinitely: every night the run reported `ok` and stepped every
-        # watermark forward one day on a calendar date alone.
-        #
-        # Measured on a fresh deploy whose first night hit an upstream
-        # incident: of the 89 days the API had and the run asked for, 5 were
-        # stored and 84 were skipped permanently, both runs `ok`. "Quiet" and
-        # "the upstream is down" look identical in a response, so with no
-        # evidence the safe reading is the one that costs a re-request rather
-        # than the data. None means "hold"; see _venue_watermark.
-        observed = _publication_frontier(con, clean, end)
-        trusted_end = None if observed is None else min(calendar_trust_line, observed)
-
-        new_watermarks, silent = _advance_watermarks(
-            con,
-            fetched,
-            end=end,
-            trusted_end=trusted_end,
-            trust_lag_days=trust_lag_days,
-            silent=silent,
-        )
-
-        summary.rows_quarantined = len(bad)
-        # Record the rate before the gate can raise, so a failed run logs the
-        # number that explains why it failed rather than 0.0.
-        summary.reject_rate = quality.reject_rate(summary.rows_fetched, summary.rows_quarantined)
-
-        held = _apply_gate(con, fetched, bad, max_reject_rate, silent)
-
-        clean = [r for r in clean if r.venue_id not in held]
-        for venue_id in held:
-            new_watermarks.pop(venue_id, None)
-
-        summary.note = "; ".join([*stalled, *silent])
-
-        # Set before the load, because the load is what writes the run log now.
-        summary.rows_loaded = len(clean)
-        # `ok` has to mean the warehouse is current, not merely that tonight
-        # added no NEW problems. A venue held tonight, and a venue whose
-        # watermark is still parked behind an unresolved rejection from an
-        # earlier night, are both reasons a reader should not trust the table to
-        # be complete -- and the second one is what used to report `ok`.
-        #
-        # Measured on the rule this replaces, five of eight venues drifting:
-        # nights 1-19 refused the whole extract, then every night from 20 said
-        # `ok` while all five were still stuck.
-        blocked = {
-            row[0]
-            for row in con.execute(
-                "SELECT DISTINCT venue_id FROM quarantine "
-                "WHERE view_date IS NOT NULL AND resolution IS DISTINCT FROM ?",
-                [ACCEPTED],
-            ).fetchall()
-        }
-        unresolved = held | blocked
-        if unresolved:
-            summary.note = "; ".join(
-                [*stalled, *silent, f"unresolved: {', '.join(sorted(unresolved))}"]
-            )
-        summary.status = "degraded" if unresolved else "ok"
-        _load(con, run_id, clean, bad, new_watermarks, summary, started_at)
-
-    except Exception as exc:
-        summary.status = "failed"
-        summary.rows_loaded = 0
-        # Append rather than replace. A run that abandoned days and *then* failed
-        # is the run whose note is worth most, and overwriting it lost the half
-        # that does not turn up in the traceback. `stalled` is read here rather
-        # than from summary.note because the failure may have come mid-loop,
-        # before the note was composed at all.
-        summary.note = "; ".join([*stalled, *silent, f"{type(exc).__name__}: {exc}"])
-        # Nothing was loaded on this path - the transaction rolled back, or never
-        # opened - so this write stands alone and cannot contradict the data.
-        #
-        # Except for the rejected rows, on a gate abort. The whole self-heal
-        # story ("those rejected rows are in `quarantine` by the next run, so
-        # they are no longer novel, the venue drops out of `held`") depends on
-        # quarantine being written, and quarantine is written by _load, which
-        # runs AFTER the gate. So an abort threw away the very record that lets
-        # the next run get past the same gate: `already` stayed empty, `novel`
-        # stayed equal to `bad`, `held` was the same set every night, and the
-        # majority branch re-armed itself forever - starving the healthy venues
-        # too, since their clean rows go through the same _load.
-        #
-        # Rejected rows only. No pageviews, no watermarks: the gate said do not
-        # trust tonight's extract, and that judgement stands. What changes is
-        # that the run now leaves behind the evidence of what it rejected, which
-        # is what turns "refuse tonight" into something other than "refuse
-        # forever".
-        if isinstance(exc, quality.QualityGateFailed) and bad:
-            _quarantine_rejects(con, run_id, bad, summary, started_at)
-        else:
-            _write_run_log(con, summary, started_at)
-        raise
-
-    return summary
+            held.add(venue_id)
+            notes.append(f"{venue_id}: {fresh}/{seen} newly rejected, above the ceiling, held")
+    return held, notes
 
 
 def _publication_frontier(con, clean: list[quality.CleanRow], end: date) -> date | None:
     """The newest day any venue has ever produced a row for, or None if none has.
 
     Read from the warehouse as well as from this run, because during a stall this
-    run sees nothing at all: every venue's watermark already consumed everything
-    published, so each one asks for days beyond the frontier and gets an empty
-    answer. Judging on this run alone would fall back to the calendar line in
-    exactly the case the frontier exists to cover.
+    run sees nothing at all. Bounded by `end`, so a future-dated row that predates
+    the acceptance rules cannot pin the frontier open for ever.
     """
     stored = con.execute(
-        # Bounded by `end`: a row dated in the future - drift that predates the
-        # acceptance rules, or a hand-inserted one - would otherwise be the newest
-        # day in the table for ever, pinning the frontier above the calendar line
-        # and quietly turning this whole mechanism back off.
-        "SELECT max(view_date) FROM pageviews WHERE view_date <= ?",
-        [end],
+        "SELECT max(view_date) FROM pageviews WHERE view_date <= ?", [end]
     ).fetchone()[0]
     seen = [row.view_date for row in clean if row.view_date <= end]
     if stored is not None:
@@ -848,75 +662,361 @@ def _has_any_rows(con, venue_id: str) -> bool:
     return row is not None
 
 
-def _store_rejects(con, run_id: str, bad: list[quality.BadRow]) -> None:
-    """Keep one rejection per venue/day/rule, including malformed null dates.
+def _blocked_venues(con, venue_ids: list[str]) -> set[str]:
+    """Configured venues with an open rejection their watermark has not passed.
 
-    The caller owns the transaction. Re-observation reopens a resolved issue;
-    the original rejection remains available for provenance.
+    Only those still stand between the venue and a complete warehouse. A
+    rejection behind the watermark (a stray day outside the requested window,
+    say) is on record but blocks nothing, and one for a venue no longer in
+    venues.csv is nobody's problem tonight.
     """
-    already = set(con.execute("SELECT venue_id, view_date, rule FROM quarantine").fetchall())
+    if not venue_ids:
+        return set()
+    rows = con.execute(
+        "SELECT DISTINCT q.venue_id FROM quarantine q "
+        "LEFT JOIN watermark w ON w.venue_id = q.venue_id "
+        "WHERE q.resolution IS NULL AND list_contains(?, q.venue_id) "
+        "AND (w.last_date IS NULL "
+        "     OR coalesce(q.view_date, q.window_start) IS NULL "
+        "     OR coalesce(q.view_date, q.window_start) > w.last_date)",
+        [venue_ids],
+    ).fetchall()
+    return {row[0] for row in rows}
+
+
+@dataclass
+class _Report:
+    """The note's parts, kept apart so a failure part-way can still say all of them."""
+
+    gave_up: list[str] = field(default_factory=list)
+    failures: list[str] = field(default_factory=list)
+    other: list[str] = field(default_factory=list)
+
+    def lines(self) -> list[str]:
+        return [*self.gave_up, *self.failures, *self.other]
+
+
+def run(
+    con,
+    venues: list[Venue],
+    *,
+    today: date | None = None,
+    chunk_days: int = DEFAULT_CHUNK_DAYS,
+    backfill_days: int = DEFAULT_BACKFILL_DAYS,
+    max_reject_rate: float = DEFAULT_MAX_REJECT_RATE,
+    max_lookback_days: int = DEFAULT_MAX_LOOKBACK_DAYS,
+    trust_lag_days: int = TRUST_LAG_DAYS,
+    max_http_requests: int | None = DEFAULT_MAX_HTTP_REQUESTS,
+    fetch=None,
+    opener=client.http_get,
+) -> RunSummary:
+    """One ingest run on an open connection, which is held throughout.
+
+    `fetch(article, start, end)` defaults to `client.fetch_window` over `opener`,
+    counted and bounded by `max_http_requests`. An injected `fetch` is not
+    counted, and `http_requests` is then NULL.
+    """
+    return _run(
+        lambda: contextlib.nullcontext(con),
+        venues,
+        today=today,
+        chunk_days=chunk_days,
+        backfill_days=backfill_days,
+        max_reject_rate=max_reject_rate,
+        max_lookback_days=max_lookback_days,
+        trust_lag_days=trust_lag_days,
+        max_http_requests=max_http_requests,
+        fetch=fetch,
+        opener=opener,
+    )
+
+
+def run_at(db_path: str | Path, venues: list[Venue], **options) -> RunSummary:
+    """Like `run`, but opens the warehouse only to plan and to load.
+
+    DuckDB lets one process write a file at a time, and a read-write connection
+    locks out every other process, readers included. Holding it through the
+    fetch locked out `resolve` and any BI tool for as long as the network took.
+    """
+    return _run(lambda: _opened(db_path), venues, **options)
+
+
+@contextlib.contextmanager
+def _opened(db_path: str | Path) -> Iterator[duckdb.DuckDBPyConnection]:
+    con = connect(db_path)
+    try:
+        yield con
+    finally:
+        con.close()
+
+
+def _run(
+    session: Callable[[], contextlib.AbstractContextManager],
+    venues: list[Venue],
+    *,
+    today: date | None = None,
+    chunk_days: int = DEFAULT_CHUNK_DAYS,
+    backfill_days: int = DEFAULT_BACKFILL_DAYS,
+    max_reject_rate: float = DEFAULT_MAX_REJECT_RATE,
+    max_lookback_days: int = DEFAULT_MAX_LOOKBACK_DAYS,
+    trust_lag_days: int = TRUST_LAG_DAYS,
+    max_http_requests: int | None = DEFAULT_MAX_HTTP_REQUESTS,
+    fetch=None,
+    opener=client.http_get,
+) -> RunSummary:
+    validate_params(
+        chunk_days,
+        backfill_days,
+        max_reject_rate,
+        max_lookback_days,
+        trust_lag_days,
+        max_http_requests,
+    )
+    today = today or datetime.now(UTC).date()
+    end = today - timedelta(days=PUBLICATION_LAG_DAYS)
+    floor = end - timedelta(days=max_lookback_days - 1)
+    calendar_trust_line = today - timedelta(days=trust_lag_days)
+
+    counter = None
+    if fetch is None:
+        counter = client.CountingOpener(opener, budget=max_http_requests)
+        fetch = functools.partial(client.fetch_window, opener=counter)
+
+    run_id = uuid.uuid4().hex[:12]
+    started_at = utc_now()
+    summary = RunSummary(run_id=run_id, status="running", venues=len(venues))
+    report = _Report()
+
+    try:
+        with session() as con:
+            plans = _plan(con, venues, end=end, floor=floor, backfill_days=backfill_days)
+        report.gave_up = [
+            f"{p.venue.venue_id}: gave up on {p.gave_up_days} days" for p in plans if p.gave_up_days
+        ]
+
+        outcome = _fetch_all(plans, end=end, chunk_days=chunk_days, fetch=fetch, summary=summary)
+        summary.http_requests = counter.count if counter else None
+        report.failures = list(outcome.failures.values())
+        if venues and len(outcome.failures) == len(venues):
+            raise client.ApiError(f"all {len(venues)} requested venues failed")
+
+        with session() as con:
+            _finish(
+                con,
+                venues,
+                plans,
+                outcome,
+                summary=summary,
+                report=report,
+                started_at=started_at,
+                end=end,
+                calendar_trust_line=calendar_trust_line,
+                trust_lag_days=trust_lag_days,
+                max_reject_rate=max_reject_rate,
+            )
+
+    except Exception as exc:
+        summary.status = "failed"
+        summary.rows_loaded = 0
+        summary.http_requests = counter.count if counter else None
+        # Everything the run had to say, then what stopped it: a run that gave
+        # up on days and then failed is the run whose note is worth most.
+        summary.note = "; ".join([*report.lines(), f"{type(exc).__name__}: {exc}"])
+        # Nothing was loaded on this path - the transaction rolled back, or
+        # never opened - so this write stands alone. It can fail too (the
+        # warehouse may be why the run failed), and must not hide the reason.
+        try:
+            with session() as con:
+                _write_run_log(con, summary, started_at)
+        except Exception as log_exc:
+            log.error("could not record the failed run %s: %s", run_id, log_exc)
+        raise
+
+    return summary
+
+
+def _finish(
+    con,
+    venues: list[Venue],
+    plans: list[Plan],
+    outcome: FetchOutcome,
+    *,
+    summary: RunSummary,
+    report: _Report,
+    started_at: datetime,
+    end: date,
+    calendar_trust_line: date,
+    trust_lag_days: int,
+    max_reject_rate: float,
+) -> None:
+    clean = [row for f in outcome.fetched for row in f.clean]
+    bad = [row for f in outcome.fetched for row in f.bad]
+
+    # How far the upstream has demonstrably published. Publication is a property
+    # of the API, not of one article, so the newest day any venue has produced -
+    # this run or before - is evidence for all of them. The calendar line alone
+    # was a bet that the lag never outruns it; bounded by what has been seen, a
+    # stall costs a re-request instead of the days. With no evidence anywhere,
+    # nothing is trusted and no watermark moves.
+    observed = _publication_frontier(con, clean, end)
+    trusted_end = None if observed is None else min(calendar_trust_line, observed)
+
+    new_watermarks, never_produced, watermark_notes = _advance_watermarks(
+        con, outcome.fetched, end=end, trusted_end=trusted_end, trust_lag_days=trust_lag_days
+    )
+
+    summary.rows_quarantined = len(bad)
+    summary.reject_rate = quality.reject_rate(summary.rows_fetched, summary.rows_quarantined)
+
+    held, gate_notes = _apply_gate(con, outcome.fetched, bad, max_reject_rate)
+    clean = [row for row in clean if row.venue_id not in held]
+    for venue_id in held:
+        new_watermarks.pop(venue_id, None)
+    summary.rows_loaded = len(clean)
+    report.other = [*watermark_notes, *gate_notes]
+
+    def settle(con) -> None:
+        # Inside the transaction, after tonight's rejects and watermarks are
+        # written: a venue that first rejects a day tonight is unresolved
+        # tonight, not from tomorrow.
+        status, unresolved = decide_status(
+            held=held,
+            blocked=_blocked_venues(con, [v.venue_id for v in venues]),
+            failed=set(outcome.failures),
+            gave_up={p.venue.venue_id for p in plans if p.gave_up_days},
+            never_produced=never_produced,
+        )
+        summary.status = status
+        lines = report.lines()
+        if unresolved:
+            lines.append(f"unresolved: {', '.join(unresolved)}")
+        summary.note = "; ".join(lines)
+
+    articles = {f.venue.venue_id: f.venue.wiki_article for f in outcome.fetched}
+    _load(
+        con,
+        summary.run_id,
+        clean,
+        bad,
+        {venue_id: (last, articles[venue_id]) for venue_id, last in new_watermarks.items()},
+        summary,
+        started_at,
+        settle=settle,
+    )
+    log.info(
+        "run %s %s: %d loaded, %d quarantined",
+        summary.run_id,
+        summary.status,
+        summary.rows_loaded,
+        summary.rows_quarantined,
+    )
+
+
+def _store_rejects(con, run_id: str, bad: list[quality.BadRow]) -> None:
+    """Keep one rejection per key (see `_reject_key`); the caller owns the transaction.
+
+    Seeing a rejection again reopens it if it had been superseded - the day
+    loaded cleanly once and has gone bad again. An accepted one stays accepted:
+    the API keeps answering the same way, and reopening it would undo the
+    decision on the very next run. The operator's note survives either way.
+    """
+    already = set(con.execute(f"SELECT {_KEY_COLUMNS} FROM quarantine").fetchall())
     now = utc_now()
     for row in bad:
-        key = (row.venue_id, row.view_date, row.rule)
+        key = _reject_key(row.venue_id, row.view_date, row.rule, row.window_start)
         if key in already:
             con.execute(
-                # An accepted day stays accepted. Re-observing it is expected --
-                # the API keeps answering the same way -- so reopening it would
-                # undo the decision on the next run and put the venue straight
-                # back into the dead end.
-                "UPDATE quarantine SET resolved_at = NULL, resolution = NULL "
-                "WHERE venue_id = ? AND view_date IS NOT DISTINCT FROM ? AND rule = ? "
-                "AND resolved_at IS NOT NULL "
-                "AND resolution IS DISTINCT FROM 'accepted'",
-                key,
+                f"UPDATE quarantine SET resolved_at = NULL, resolution = NULL "
+                f"WHERE {_KEY_MATCH} AND resolution = ?",
+                [*key, SUPERSEDED],
             )
             continue
         con.execute(
-            "INSERT INTO quarantine "
-            "(run_id, venue_id, article, view_date, rule, detail, raw, seen_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            [run_id, row.venue_id, row.article, row.view_date, row.rule, row.detail, row.raw, now],
+            "INSERT INTO quarantine (run_id, venue_id, article, view_date, rule, detail, raw, "
+            "seen_at, window_start, window_end) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            [
+                run_id,
+                row.venue_id,
+                row.article,
+                row.view_date,
+                row.rule,
+                row.detail,
+                row.raw,
+                now,
+                row.window_start,
+                row.window_end,
+            ],
         )
         already.add(key)
 
 
-ACCEPTED = "accepted"
+def _supersede(con, run_id: str, now: datetime) -> None:
+    """Close the open rejections for every day this run loaded cleanly.
 
-
-def resolve(con, venue_id: str, view_date: date | None, resolution: str) -> int:
-    """Record a decision about quarantined days.
-
-    Two kinds of decision, because they have different consequences.
-
-    A note ("reviewed", "chased upstream") is annotation. The day stays a hard
-    stop: the watermark still refuses to step over it, because the data is
-    still missing and the quarantine is still a record of that.
-
-    `accepted` is the operator saying the day is never coming. Holding a venue
-    is per venue now, so a title that drifted permanently is held permanently
-    and nothing heals it on its own -- that is the correct behaviour for the
-    other seven venues, and a dead end for this one. Accepting is the way out:
-    the watermark may step over an accepted day, so the venue starts moving
-    again and stops rejecting the same window every night.
-
-    `view_date=None` addresses the rows a `timestamp_parses` failure left with
-    no day at all, which were previously unresolvable.
+    Without this a one-night upstream glitch kept the run `degraded` for ever,
+    after the day had loaded and the watermark had passed it, and the only way
+    out was `--accept` - which says the day is never coming, the opposite of
+    what happened.
     """
-    if not resolution.strip():
-        raise ValueError("A resolution note is required")
-    if view_date is None:
+    con.execute(
+        "UPDATE quarantine SET resolved_at = ?, resolution = ? "
+        "WHERE resolution IS NULL AND view_date IS NOT NULL AND EXISTS ("
+        "  SELECT 1 FROM pageviews p WHERE p.run_id = ? "
+        "  AND p.venue_id = quarantine.venue_id AND p.view_date = quarantine.view_date)",
+        [now, SUPERSEDED, run_id],
+    )
+
+
+# What `resolve` can be pointed at: one day, a range of days, the rejects with
+# no day, or all of a venue's rejects.
+ALL_DAYS = "all"
+Days = date | tuple[date, date] | None | str
+
+
+def _day_filter(days: Days) -> tuple[str, list]:
+    if days is None:
+        return "view_date IS NULL", []
+    if days == ALL_DAYS:
+        return "TRUE", []
+    if isinstance(days, tuple):
+        first, last = days
+        if first > last:
+            raise ValueError(f"range {first}..{last} runs backwards")
+        return "view_date BETWEEN ? AND ?", [first, last]
+    if isinstance(days, date):
+        return "view_date = ?", [days]
+    raise ValueError(f"not a day, a range, None or {ALL_DAYS!r}: {days!r}")
+
+
+def resolve(
+    con, venue_id: str, days: Days, *, note: str | None = None, accept: bool = False
+) -> int:
+    """Record a decision about quarantined rows. Returns how many rows it changed.
+
+    - A note is annotation. It releases nothing: the day stays a hard stop,
+      because the data is still missing. It survives the row reopening.
+    - `accept=True` is the operator saying the day is never coming. The
+      watermark may then step over it, which is the only way out for a venue
+      whose upstream keeps answering the same wrong thing. Only open rows are
+      accepted; the note, if given, is kept with the decision.
+
+    `days` is a date, a (first, last) range, None for the rows a
+    `timestamp_parses` failure left with no day, or ALL_DAYS.
+    """
+    where, params = _day_filter(days)
+    note = note.strip() if note else None
+    if accept:
         rows = con.execute(
-            "UPDATE quarantine SET resolved_at = ?, resolution = ? "
-            "WHERE venue_id = ? AND view_date IS NULL AND resolved_at IS NULL "
-            "RETURNING rule",
-            [utc_now(), resolution.strip(), venue_id],
+            f"UPDATE quarantine SET resolved_at = ?, resolution = ?, note = coalesce(?, note) "
+            f"WHERE venue_id = ? AND {where} AND resolution IS NULL RETURNING rule",
+            [utc_now(), ACCEPTED, note, venue_id, *params],
         ).fetchall()
     else:
+        if not note:
+            raise ValueError("A note is required to annotate a rejection")
         rows = con.execute(
-            "UPDATE quarantine SET resolved_at = ?, resolution = ? "
-            "WHERE venue_id = ? AND view_date = ? AND resolved_at IS NULL "
-            "RETURNING rule",
-            [utc_now(), resolution.strip(), venue_id, view_date],
+            f"UPDATE quarantine SET note = ? WHERE venue_id = ? AND {where} RETURNING rule",
+            [note, venue_id, *params],
         ).fetchall()
     return len(rows)
 
@@ -933,42 +1033,26 @@ def accepted_days(con, venue_id: str) -> set[date]:
     }
 
 
-def _quarantine_rejects(con, run_id, bad, summary, started_at) -> None:
-    """The gate-abort counterpart of _load: rejects and the run log, nothing else.
-
-    Same transaction shape as _load, and for the same reason - the run log has
-    to be atomic with what it claims. It claims rows_quarantined=N, and before
-    this existed that claim was false on every aborted run: the log said N and
-    the table held nothing.
-    """
-    try:
-        con.execute("BEGIN TRANSACTION")
-        _store_rejects(con, run_id, bad)
-        _write_run_log(con, summary, started_at)
-        con.execute("COMMIT")
-    except BaseException:
-        try:
-            con.execute("ROLLBACK")
-        except BaseException:
-            pass
-        # The run log matters more than the rejects: without it the run is
-        # invisible. Retry it alone, outside the transaction that just failed.
-        try:
-            _write_run_log(con, summary, started_at)
-        except BaseException:
-            pass
-        raise
+def accepted_null_windows(con, venue_id: str) -> set[tuple[str, date | None]]:
+    """(rule, window_start) of the dateless rejects an operator has accepted."""
+    return set(
+        con.execute(
+            "SELECT DISTINCT rule, window_start FROM quarantine "
+            "WHERE venue_id = ? AND resolution = ? AND view_date IS NULL",
+            [venue_id, ACCEPTED],
+        ).fetchall()
+    )
 
 
-def _load(con, run_id, clean, bad, new_watermarks, summary, started_at) -> None:
-    """Write the run: rows, quarantine, watermarks and the run log, atomically.
+def _load(con, run_id, clean, bad, new_watermarks, summary, started_at, settle=None) -> None:
+    """Write the run: rows, quarantine, watermarks, status and run log, atomically.
 
-    The run log is inside the transaction with the data it describes. Written
-    afterwards, as its own statement, it could be lost while the data survived -
-    a crash, or a `run_log` that has drifted a column - leaving rows in the
-    warehouse that no run ever claims to have loaded, and `sum(rows_loaded)`
-    quietly disagreeing with `count(*)`. A failed run has no data to disagree
-    with, so `run` writes its log separately on that path.
+    `new_watermarks` maps venue_id to (last_date, article). `settle(con)`, if
+    given, runs after everything but the run log is written, and sets the
+    summary's status and note from what is now in the warehouse.
+
+    The run log is inside the transaction with the data it describes, so
+    `sum(rows_loaded)` cannot disagree with `count(*)`.
     """
     now = utc_now()
     try:
@@ -981,26 +1065,21 @@ def _load(con, run_id, clean, bad, new_watermarks, summary, started_at) -> None:
                 [(r.venue_id, r.article, r.view_date, r.views, run_id, now) for r in clean],
             )
         _store_rejects(con, run_id, bad)
+        _supersede(con, run_id, now)
         if new_watermarks:
             con.executemany(
-                "INSERT OR REPLACE INTO watermark (venue_id, last_date, updated_at) "
-                "VALUES (?, ?, ?)",
-                [(vid, last, now) for vid, last in new_watermarks.items()],
+                "INSERT OR REPLACE INTO watermark (venue_id, last_date, updated_at, article) "
+                "VALUES (?, ?, ?, ?)",
+                [(vid, last, now, article) for vid, (last, article) in new_watermarks.items()],
             )
+        if settle is not None:
+            settle(con)
         _write_run_log(con, summary, started_at)
         con.execute("COMMIT")
     except BaseException:
-        # BaseException, not Exception: Ctrl-C and SystemExit are precisely when
-        # a half-written transaction is likeliest, and `except Exception` let
-        # both past without a ROLLBACK, leaving the connection open mid-write.
-        #
-        # This is the innermost cleanup and it re-raises, so cancellation still
-        # propagates unchanged. The run-level handler above stays on Exception
-        # on purpose - a user pressing Ctrl-C should not be written into
-        # run_log as an ordinary failure.
-        #
-        # Guarded: a ROLLBACK that itself fails (the BEGIN never took, say) must
-        # not replace the error that explains what actually went wrong.
+        # BaseException: Ctrl-C and SystemExit are when a half-written
+        # transaction is likeliest. The ROLLBACK is guarded so its own failure
+        # cannot replace the error that explains what went wrong.
         try:
             con.execute("ROLLBACK")
         except BaseException:
@@ -1012,8 +1091,8 @@ def _write_run_log(con, summary: RunSummary, started_at: datetime) -> None:
     con.execute(
         "INSERT OR REPLACE INTO run_log "
         "(run_id, started_at, finished_at, status, venues, requests, "
-        " rows_fetched, rows_loaded, rows_quarantined, reject_rate, note) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        " rows_fetched, rows_loaded, rows_quarantined, reject_rate, note, http_requests) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         [
             summary.run_id,
             started_at,
@@ -1026,5 +1105,6 @@ def _write_run_log(con, summary: RunSummary, started_at: datetime) -> None:
             summary.rows_quarantined,
             summary.reject_rate,
             summary.note,
+            summary.http_requests,
         ],
     )

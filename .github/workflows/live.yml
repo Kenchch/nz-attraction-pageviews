@@ -1,0 +1,35 @@
+name: Live smoke test
+
+# The suite stubs the network, so nothing else notices when the real API
+# changes shape. Weekly, one small request against the live endpoint.
+on:
+  schedule:
+    - cron: "17 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  live:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          python-version: "3.13"
+          enable-cache: true
+
+      - name: Install
+        run: uv sync --locked
+
+      - name: Live test
+        env:
+          RUN_LIVE: "1"
+          # Wikimedia asks for a contactable User-Agent. The repository URL is
+          # the contact for its own CI; set the NZAP_CONTACT variable to use
+          # an email address instead.
+          NZAP_CONTACT: ${{ vars.NZAP_CONTACT || format('{0}/{1}', github.server_url, github.repository) }}
+        run: uv run pytest -q -m live

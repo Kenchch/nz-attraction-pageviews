@@ -1,5 +1,5 @@
 import pytest
-from test_ingest import TODAY, VENUES, Recorder
+from helpers import TODAY, VENUES, Recorder
 
 from nz_attraction_pageviews import client, ingest
 
@@ -21,7 +21,9 @@ def test_one_http_400_does_not_stop_seven_healthy_venues(con):
         return recorder(article, start, end)
 
     summary = ingest.run(con, venues, today=TODAY, backfill_days=3, fetch=fetch)
-    assert summary.status == "ok"
+    # Seven venues loaded, and the eighth is missing its days: not `ok`.
+    assert summary.status == "degraded"
+    assert "unresolved: v0" in summary.note
     assert summary.rows_loaded == 21
     assert summary.requests == 8
     assert "v0: HTTP 400; watermark held" in summary.note

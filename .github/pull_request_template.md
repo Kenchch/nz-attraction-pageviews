@@ -13,7 +13,7 @@ from. If a check was added, say how you know it would go red.
 ## AI involvement
 
 <!--
-One line: drafted by an AI tool, reviewed by a human, or neither. This
-repository states its practice on the profile README and this is where an
+One line: drafted by an AI tool, reviewed by a human, or neither. The README
+("How this was built") states this repository's practice; this is where an
 individual change records its own.
 -->
