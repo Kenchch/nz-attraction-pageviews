@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+### Changed
+
+- Log lines and the run summary start with the UTC time, as in
+  `2026-10-30T03:30:12Z run 3f2a9c81d0e4 ok: …`. The README's cron and Task
+  Scheduler lines append every night to one `ingest.log`, and nothing in it
+  said which night a warning came from.
+
 ## 0.2.0 — 2026-09-26
 
 The run now reports `ok` only when the warehouse is complete for every venue.

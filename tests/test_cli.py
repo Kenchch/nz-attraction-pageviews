@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import io
 import json
+import re
 import time
 import urllib.error
 import urllib.parse
@@ -111,6 +112,18 @@ def test_a_failed_venue_is_degraded_and_still_exits_zero(files, monkeypatch, cap
     assert " degraded: " in out
     assert "te-papa: Te_Papa: HTTP 400" in out
     assert "unresolved: te-papa" in out
+
+
+def test_a_night_appended_to_ingest_log_says_when_it_ran(files, monkeypatch, capsys):
+    """The README's cron line appends stdout and stderr to one ingest.log."""
+    monkeypatch.setattr(urllib.request, "urlopen", FakeWikimedia(Te_Papa="http400"))
+
+    assert cli.main(ingest_args(files, "--backfill-days", "5")) == cli.EXIT_OK
+
+    out, err = capsys.readouterr()
+    utc = r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ "
+    assert re.match(utc + r"run [0-9a-f]{12} degraded: ", out), out
+    assert re.match(utc + r"WARNING nz_attraction_pageviews\.ingest: te-papa: ", err), err
 
 
 def test_schema_drift_is_one_line_and_its_own_exit_code(files, monkeypatch, capsys):
