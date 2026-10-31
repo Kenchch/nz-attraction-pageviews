@@ -12,6 +12,7 @@ import argparse
 import functools
 import logging
 import sys
+import time
 from datetime import date
 from pathlib import Path
 
@@ -33,6 +34,10 @@ EXIT_DRIFT = 5  # the API's response contract changed
 EXIT_DATABASE = 6  # the warehouse could not be opened or written (locked, say)
 
 log = logging.getLogger("nz_attraction_pageviews")
+
+# UTC with the date, like run_log.started_at. The README's cron line appends
+# every night to one ingest.log, so a line has to say which night it is from.
+TIME_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
 
 
 def _bounded_int(text: str) -> int:
@@ -142,7 +147,11 @@ class _StderrHandler(logging.StreamHandler):
 
     def __init__(self):
         super().__init__()
-        self.setFormatter(logging.Formatter("%(levelname)s %(name)s: %(message)s"))
+        formatter = logging.Formatter(
+            "%(asctime)s %(levelname)s %(name)s: %(message)s", TIME_FORMAT
+        )
+        formatter.converter = time.gmtime
+        self.setFormatter(formatter)
 
     @property
     def stream(self):
@@ -299,7 +308,7 @@ def _ingest(args) -> int:
 
     http = "" if summary.http_requests is None else f" ({summary.http_requests} HTTP calls)"
     print(
-        f"run {summary.run_id} {summary.status}: "
+        f"{time.strftime(TIME_FORMAT, time.gmtime())} run {summary.run_id} {summary.status}: "
         f"{summary.requests} requests{http}, "
         f"{summary.rows_fetched} fetched, "
         f"{summary.rows_loaded} loaded, "
