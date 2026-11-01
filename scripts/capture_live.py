@@ -14,7 +14,7 @@ import argparse
 import functools
 import json
 from dataclasses import asdict
-from datetime import date, datetime, timedelta, timezone
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
 from nz_attraction_pageviews import client, ingest
@@ -23,7 +23,7 @@ from nz_attraction_pageviews import client, ingest
 def main():
     # UTC, because the pipeline's day is a UTC day: a local date.today() in New
     # Zealand is a day ahead of it for half of every day.
-    today_utc = datetime.now(timezone.utc).date()
+    today_utc = datetime.now(UTC).date()
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
@@ -62,7 +62,7 @@ def main():
     finally:
         con.close()
     evidence = {
-        "captured_at_utc": datetime.now(timezone.utc).isoformat(),
+        "captured_at_utc": datetime.now(UTC).isoformat(),
         "captures": captures,
         "run_summary": asdict(summary),
         "storage": "fresh in-memory DuckDB; seven-day backfill across venues.csv",
