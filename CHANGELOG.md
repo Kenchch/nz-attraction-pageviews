@@ -8,6 +8,8 @@
   `2026-10-30T03:30:12Z run 3f2a9c81d0e4 ok: …`. The README's cron and Task
   Scheduler lines append every night to one `ingest.log`, and nothing in it
   said which night a warning came from.
+- Python 3.11 or newer is required. 3.10 reached end of life on 2026-10-01,
+  and CI no longer tests it.
 
 ## 0.2.0 — 2026-09-26
 

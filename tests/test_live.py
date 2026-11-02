@@ -4,7 +4,7 @@ Needs a contact for the User-Agent: set NZAP_CONTACT to an email address or URL.
 """
 
 import os
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
@@ -22,7 +22,7 @@ def contact():
 @pytest.mark.skipif(os.getenv("RUN_LIVE") != "1", reason="Set RUN_LIVE=1 to contact Wikimedia")
 def test_live_pageviews(contact):
     # UTC, like the pipeline: a local date can be a day ahead of the API's.
-    end = datetime.now(timezone.utc).date() - timedelta(days=3)
+    end = datetime.now(UTC).date() - timedelta(days=3)
     result = client.fetch_window("Milford_Sound", end - timedelta(days=6), end)
     assert result
     assert all("views" in row for row in result)

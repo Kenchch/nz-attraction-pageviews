@@ -461,7 +461,7 @@ captured live responses are run through the parser and the acceptance rules, so
 a contract that drifts from what the API actually sends fails offline.
 
 CI installs from `uv.lock`, then runs lint, format check, the tests with a 90%
-coverage floor, and a package build, on Python 3.10 through 3.13. A separate
+coverage floor, and a package build, on Python 3.11 through 3.13. A separate
 workflow runs the live smoke test weekly.
 
 ## Limits

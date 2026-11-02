@@ -8,14 +8,12 @@ from __future__ import annotations
 
 import contextlib
 from collections.abc import Iterator
-from datetime import date, datetime, timezone
+from datetime import UTC, date, datetime
 from pathlib import Path
 
 import duckdb
 
 from . import quality
-
-UTC = timezone.utc  # datetime.UTC only exists from 3.11; this keeps 3.10 working
 
 ACCEPTED = "accepted"  # an operator decided the day is never arriving
 SUPERSEDED = "superseded"  # the day later loaded cleanly
