@@ -10,6 +10,7 @@
   said which night a warning came from.
 - Python 3.11 or newer is required. 3.10 reached end of life on 2026-10-01,
   and CI no longer tests it.
+- CI also tests Python 3.14.
 
 ## 0.2.0 — 2026-09-26
 
