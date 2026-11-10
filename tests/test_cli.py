@@ -9,6 +9,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import warnings
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
@@ -19,6 +20,7 @@ from nz_attraction_pageviews import __main__ as cli
 from nz_attraction_pageviews import client, quality, store
 
 TODAY = "2026-03-01"
+UTC = r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ "
 CSV = (
     "venue_id,venue_name,region,wiki_article\n"
     "milford-sound,Milford Sound,Fiordland,Milford_Sound\n"
@@ -121,9 +123,50 @@ def test_a_night_appended_to_ingest_log_says_when_it_ran(files, monkeypatch, cap
     assert cli.main(ingest_args(files, "--backfill-days", "5")) == cli.EXIT_OK
 
     out, err = capsys.readouterr()
-    utc = r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ "
-    assert re.match(utc + r"run [0-9a-f]{12} degraded: ", out), out
-    assert re.match(utc + r"WARNING nz_attraction_pageviews\.ingest: te-papa: ", err), err
+    assert re.match(UTC + r"run [0-9a-f]{12} degraded: ", out), out
+    assert re.search(r" in \d+\.\ds$", out.splitlines()[0]), out
+    assert re.match(UTC + r"WARNING nz_attraction_pageviews\.ingest: te-papa: ", err), err
+
+
+def test_a_crash_is_a_timestamped_traceback_and_its_own_exit_code(files, monkeypatch, capsys):
+    """A bug used to leave ingest.log a bare traceback with no time, and exit 1,
+    which the scheduler table reads as "nothing matched"."""
+
+    def broken(*args, **kwargs):
+        raise KeyError("a bug")
+
+    monkeypatch.setattr(cli.ingest, "run_at", broken)
+
+    assert cli.main(ingest_args(files)) == cli.EXIT_CRASH
+
+    err = capsys.readouterr().err
+    assert re.match(UTC + r"CRITICAL nz_attraction_pageviews: ingest crashed\n", err), err
+    assert "Traceback" in err and "KeyError: 'a bug'" in err
+
+
+def test_a_python_warning_is_a_timestamped_line(files, monkeypatch, capsys):
+    api = FakeWikimedia()
+
+    def warns(request, timeout=None):
+        warnings.warn("something is deprecated", DeprecationWarning, stacklevel=1)
+        return api(request, timeout)
+
+    monkeypatch.setattr(urllib.request, "urlopen", warns)
+    with warnings.catch_warnings():
+        warnings.simplefilter("always")
+        assert cli.main(ingest_args(files, "--backfill-days", "5")) == cli.EXIT_OK
+
+    err = capsys.readouterr().err
+    assert re.match(UTC + r"WARNING py\.warnings: .*something is deprecated", err), err
+
+
+def test_verbose_says_what_the_run_was_asked_to_do(files, monkeypatch, capsys):
+    monkeypatch.setattr(urllib.request, "urlopen", FakeWikimedia())
+
+    assert cli.main(ingest_args(files, "--backfill-days", "5", "-v")) == cli.EXIT_OK
+
+    err = capsys.readouterr().err
+    assert re.match(UTC + r"INFO nz_attraction_pageviews: ingest: 3 venue\(s\) into ", err), err
 
 
 def test_schema_drift_is_one_line_and_its_own_exit_code(files, monkeypatch, capsys):
@@ -132,7 +175,10 @@ def test_schema_drift_is_one_line_and_its_own_exit_code(files, monkeypatch, caps
     assert cli.main(ingest_args(files, "--backfill-days", "5")) == cli.EXIT_DRIFT
 
     err = capsys.readouterr().err
-    assert err.startswith("error: the API's response no longer matches the contract")
+    assert re.match(
+        UTC + r"ERROR nz_attraction_pageviews: the API's response no longer matches the contract",
+        err,
+    ), err
     assert "Traceback" not in err
     assert last_run(files[1])[0] == "failed"
 
@@ -146,7 +192,7 @@ def test_no_network_fails_fast_and_says_why(files, monkeypatch, capsys):
     assert cli.main(ingest_args(files, "--backfill-days", "5")) == cli.EXIT_UPSTREAM
 
     err = capsys.readouterr().err
-    assert "error: all 3 requested venues failed" in err
+    assert "ERROR nz_attraction_pageviews: all 3 requested venues failed" in err
     assert "getaddrinfo failed" in err, "the cause is logged, not just a status code"
     assert len(api.urls) == 2 * 4, "two venues tried, four attempts each; the third is not"
     status, note, http_requests = last_run(files[1])
@@ -177,7 +223,9 @@ def test_a_missing_venues_file_is_one_line(files, capsys):
     _, db = files
     code = cli.main(["--venues", "nope.csv", "--db", str(db), "--today", TODAY])
     assert code == cli.EXIT_CONFIG
-    assert capsys.readouterr().err.startswith("error: ")
+    err = capsys.readouterr().err
+    assert re.match(UTC + r"ERROR nz_attraction_pageviews: ", err), err
+    assert len(err.splitlines()) == 1
 
 
 def test_a_live_run_without_a_contact_is_refused(files, monkeypatch, capsys):

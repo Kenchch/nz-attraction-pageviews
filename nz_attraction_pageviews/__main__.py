@@ -32,8 +32,10 @@ EXIT_CONFIG = 3  # venues.csv, parameters, contact, missing warehouse
 EXIT_UPSTREAM = 4  # every venue failed: network, HTTP errors, request budget
 EXIT_DRIFT = 5  # the API's response contract changed
 EXIT_DATABASE = 6  # the warehouse could not be opened or written (locked, say)
+EXIT_CRASH = 7  # a bug: an error nothing above names. Python's own 1 would read as code 1 above
 
 log = logging.getLogger("nz_attraction_pageviews")
+_warnings = logging.getLogger("py.warnings")  # where logging.captureWarnings sends them
 
 # UTC with the date, like run_log.started_at. The README's cron line appends
 # every night to one ingest.log, so a line has to say which night it is from.
@@ -138,7 +140,9 @@ def _parser() -> argparse.ArgumentParser:
 
 
 def _fail(code: int, message: object) -> int:
-    print(f"error: {message}", file=sys.stderr)
+    # Logged, not printed: in the appended ingest.log a failure needs its time
+    # as much as a warning does, and ERROR is what an operator greps for.
+    log.error("%s", message)
     return code
 
 
@@ -166,15 +170,32 @@ def _configure_logging(verbose: bool) -> None:
     # On the package's logger, not the root: basicConfig does nothing when
     # something (a test runner, a host application) has configured the root.
     if not any(isinstance(h, _StderrHandler) for h in log.handlers):
-        log.addHandler(_StderrHandler())
+        handler = _StderrHandler()
+        log.addHandler(handler)
+        _warnings.addHandler(handler)
     log.setLevel(logging.INFO if verbose else logging.WARNING)
+    # Python warnings (a DuckDB deprecation, say) get the same timestamped line.
+    # Off, then on: logging only installs its hook when it has none saved, and a
+    # test framework that restores warnings.showwarning leaves a stale one.
+    logging.captureWarnings(False)
+    logging.captureWarnings(True)
 
 
 def main(argv=None) -> int:
     parser = _parser()
     args = parser.parse_args(argv)
     _configure_logging(args.verbose)
+    try:
+        return _dispatch(parser, args)
+    except Exception:
+        # Every expected failure is caught and named where it happens. What
+        # reaches here is a bug, and its traceback gets a timestamp and a level
+        # like any other line, where Python's own would have neither.
+        log.critical("%s crashed", args.command, exc_info=True)
+        return EXIT_CRASH
 
+
+def _dispatch(parser: argparse.ArgumentParser, args) -> int:
     if args.command == "resolve":
         if not args.venue_id or args.days is None:
             parser.error("resolve requires a venue_id and a day, range, 'null' or 'all'")
@@ -287,6 +308,8 @@ def _ingest(args) -> int:
     except (OSError, ValueError, client.ConfigError) as exc:
         return _fail(EXIT_CONFIG, exc)
 
+    log.info("ingest: %d venue(s) into %s", len(venues), args.db)
+    started = time.perf_counter()
     try:
         summary = ingest.run_at(
             args.db,
@@ -313,7 +336,8 @@ def _ingest(args) -> int:
         f"{summary.rows_fetched} fetched, "
         f"{summary.rows_loaded} loaded, "
         f"{summary.rows_quarantined} quarantined "
-        f"({summary.reject_rate:.2%})"
+        f"({summary.reject_rate:.2%}) "
+        f"in {time.perf_counter() - started:.1f}s"
     )
     if summary.note:
         print(summary.note)

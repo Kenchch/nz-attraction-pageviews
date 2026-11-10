@@ -4,6 +4,16 @@
 
 ### Changed
 
+- Errors are logged, not printed: `error: …` on stderr is now
+  `2026-10-30T03:30:12Z ERROR nz_attraction_pageviews: …`, so a failed night in
+  the appended `ingest.log` says when it failed. Anything that matched on the
+  `error: ` prefix needs to match on ` ERROR ` instead.
+- An unexpected error exits `7`, with its traceback logged as `CRITICAL` and
+  timestamped. It used to exit with Python's own `1`, which this command
+  documents as "nothing matched", after a traceback with no time on it.
+- Python warnings are logged as timestamped `WARNING py.warnings` lines.
+- The run summary ends with how long the run took, and `-v` starts with what
+  the run was asked to do.
 - Log lines and the run summary start with the UTC time, as in
   `2026-10-30T03:30:12Z run 3f2a9c81d0e4 ok: …`. The README's cron and Task
   Scheduler lines append every night to one `ingest.log`, and nothing in it
