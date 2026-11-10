@@ -593,7 +593,7 @@ def _run(
             with session() as con:
                 store.write_run_log(con, summary, started_at)
         except Exception as log_exc:
-            log.error("could not record the failed run %s: %s", run_id, log_exc)
+            log.error("could not record the failed run %s: %s", run_id, log_exc, exc_info=True)
         raise
 
     return summary

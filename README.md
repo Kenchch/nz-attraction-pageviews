@@ -69,10 +69,17 @@ to log each venue and window. The CLI prints operational notes as well as row
 counts. Installing the package also installs the same command as
 `nz-attraction-pageviews`.
 
+The run summary goes to stdout and ends with how long the run took. Retries,
+held watermarks, errors and Python warnings go to stderr, one line each, as
+`2026-10-30T03:30:12Z ERROR nz_attraction_pageviews: …` in UTC, so
+`grep -E "WARNING|ERROR|CRITICAL" ingest.log` finds every night that needs a
+look. The durable record of each run is the `run_log` table.
+
 Exit codes: `0` ok or degraded (read the status line), `1` nothing matched
 (`resolve`) or a bad title (`check-venues`), `2` bad arguments, `3`
 configuration (venues.csv, parameters, contact, missing warehouse), `4` every
-venue failed, `5` schema drift, `6` the warehouse could not be opened or written.
+venue failed, `5` schema drift, `6` the warehouse could not be opened or written, `7` an
+unexpected error (a bug; the traceback is logged as `CRITICAL`).
 
 ## Running it nightly
 
@@ -85,6 +92,7 @@ on the exit code:
 | `4` | Every venue failed (network, HTTP, request budget) | Let the next night retry; alert if it repeats |
 | `6` | Warehouse locked or unwritable | Retry later; nothing was loaded, so a retry is safe |
 | `3`, `5` | Configuration or schema drift | A person has to look; retrying will not help |
+| `7` | Unexpected error (a bug) | A person has to look; the traceback is in the log as `CRITICAL` |
 
 cron, at 03:30 UTC (after Wikimedia's daily publication):
 
